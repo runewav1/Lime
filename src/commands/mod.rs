@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, env, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    env,
+    path::PathBuf,
+};
 
 use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
@@ -24,11 +28,22 @@ pub fn run() -> Result<()> {
                 e.exit();
             }
             let json_mode = std::env::args().any(|a| a == "--json");
+            // When no subcommand is given and not in JSON mode, show help and exit cleanly.
+            if !json_mode
+                && matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                )
+            {
+                let _ = e.print();
+                std::process::exit(0);
+            }
             exit_error(&e.to_string(), json_mode);
         }
     };
 
     let json_mode = cli.json;
+    let verbose = cli.verbose;
 
     let root = match env::current_dir() {
         Ok(dir) => dir,
@@ -52,13 +67,18 @@ pub fn run() -> Result<()> {
     };
 
     match result {
-        Ok(payload) => {
+        Ok(mut payload) => {
             if json_mode {
                 println!(
                     "{}",
                     serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string())
                 );
             } else {
+                if verbose {
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert("verbose".into(), json!(true));
+                    }
+                }
                 print!("{}", crate::format::render(&payload));
             }
         }
@@ -86,10 +106,23 @@ fn exit_error(message: &str, json_mode: bool) -> ! {
 /// Indexes functions, structs, classes, and more across your project.
 /// Run `lime <command> --help` for details on any subcommand.
 #[derive(Debug, Parser)]
-#[command(name = "lime", version)]
+#[command(
+    name = "lime",
+    version,
+    after_long_help = r#"Examples:
+  lime sync                      Rebuild entire index
+  lime search run                Find components named "run"
+  lime search rust fn run        Search Rust functions
+  lime list rust                 Show Rust component counts
+  lime list rust --all           List all Rust components
+  lime deps fn-61bcc6dabec3f308  Show dependency matrix"#
+)]
 struct Cli {
-    #[arg(long, global = true, help = "Output raw JSON (for scripts and agents)")]
+    #[arg(long, global = true, help = "Output raw JSON for scripts and agents")]
     json: bool,
+
+    #[arg(short = 'v', long, global = true, help = "Show detailed output")]
+    verbose: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -275,40 +308,87 @@ fn handle_search(root: PathBuf, terms: Vec<String>) -> Result<Value> {
 
     let query = parse_search_terms(terms)?;
     let config = LimeConfig::load_or_create(&root)?;
-    let index = storage::load_index_or_empty(&root, &config)?;
+    let timer = std::time::Instant::now();
+    let mut index = storage::load_index_or_empty(&root, &config)?;
 
     let normalized_query = query.query.to_ascii_lowercase();
+    if index.search_index.is_none() {
+        index.search_index = Some(index.build_search_index());
+    }
 
-    let mut results: Vec<&ComponentRecord> = index
-        .components
-        .iter()
-        .filter(|component| {
-            if let Some(language) = &query.language {
-                if component.language != *language {
-                    return false;
+    let mut results: Vec<&ComponentRecord> = if let Some(search_index) = &index.search_index {
+        let mut matched_indices = HashSet::new();
+
+        if let Some(indices) = search_index.get(&normalized_query) {
+            for &component_index in indices {
+                if let Some(component) = index.components.get(component_index) {
+                    if matches_search_filters(component, &query) {
+                        matched_indices.insert(component_index);
+                    }
                 }
             }
+        }
 
-            if let Some(component_type) = &query.component_type {
-                if component.component_type.to_ascii_lowercase() != *component_type {
-                    return false;
-                }
+        for (name, indices) in search_index {
+            if name == &normalized_query || !name.contains(&normalized_query) {
+                continue;
             }
 
-            component
-                .name
+            for &component_index in indices {
+                if let Some(component) = index.components.get(component_index) {
+                    if matches_search_filters(component, &query) {
+                        matched_indices.insert(component_index);
+                    }
+                }
+            }
+        }
+
+        for (component_index, component) in index.components.iter().enumerate() {
+            if !matches_search_filters(component, &query) {
+                continue;
+            }
+
+            if component
+                .id
                 .to_ascii_lowercase()
                 .contains(&normalized_query)
-                || component
-                    .id
-                    .to_ascii_lowercase()
-                    .contains(&normalized_query)
                 || component
                     .file
                     .to_ascii_lowercase()
                     .contains(&normalized_query)
-        })
-        .collect();
+            {
+                matched_indices.insert(component_index);
+            }
+        }
+
+        matched_indices
+            .into_iter()
+            .filter_map(|component_index| index.components.get(component_index))
+            .collect()
+    } else {
+        index
+            .components
+            .iter()
+            .filter(|component| {
+                if !matches_search_filters(component, &query) {
+                    return false;
+                }
+
+                component
+                    .name
+                    .to_ascii_lowercase()
+                    .contains(&normalized_query)
+                    || component
+                        .id
+                        .to_ascii_lowercase()
+                        .contains(&normalized_query)
+                    || component
+                        .file
+                        .to_ascii_lowercase()
+                        .contains(&normalized_query)
+            })
+            .collect()
+    };
 
     results.sort_by(|left, right| {
         (
@@ -329,13 +409,32 @@ fn handle_search(root: PathBuf, terms: Vec<String>) -> Result<Value> {
             ))
     });
 
+    let elapsed = timer.elapsed();
+
     Ok(json!({
         "ok": true,
         "command": "search",
+        "elapsed_secs": elapsed.as_secs_f64(),
         "query": query,
         "result_count": results.len(),
         "results": results
     }))
+}
+
+fn matches_search_filters(component: &ComponentRecord, query: &SearchQuery) -> bool {
+    if let Some(language) = &query.language {
+        if component.language != *language {
+            return false;
+        }
+    }
+
+    if let Some(component_type) = &query.component_type {
+        if component.component_type.to_ascii_lowercase() != *component_type {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn handle_list(
@@ -345,6 +444,7 @@ fn handle_list(
     mut all: bool,
 ) -> Result<Value> {
     let config = LimeConfig::load_or_create(&root)?;
+    let timer = std::time::Instant::now();
     let index = storage::load_index_or_empty(&root, &config)?;
 
     if matches!(component_type.as_deref(), Some("-all")) {
@@ -357,10 +457,12 @@ fn handle_list(
     }
 
     let Some(language) = language else {
+        let elapsed = timer.elapsed();
         return Ok(json!({
             "ok": true,
             "command": "list",
             "mode": "languages",
+            "elapsed_secs": elapsed.as_secs_f64(),
             "languages": index.languages
         }));
     };
@@ -376,10 +478,12 @@ fn handle_list(
         let component_type = component_type.to_ascii_lowercase();
         components
             .retain(|component| component.component_type.to_ascii_lowercase() == component_type);
+        let elapsed = timer.elapsed();
         return Ok(json!({
             "ok": true,
             "command": "list",
             "mode": "language_and_type",
+            "elapsed_secs": elapsed.as_secs_f64(),
             "language": language,
             "type": component_type,
             "count": components.len(),
@@ -405,10 +509,12 @@ fn handle_list(
                 ))
         });
 
+        let elapsed = timer.elapsed();
         return Ok(json!({
             "ok": true,
             "command": "list",
             "mode": "language_all",
+            "elapsed_secs": elapsed.as_secs_f64(),
             "language": language,
             "count": components.len(),
             "components": components
@@ -420,10 +526,12 @@ fn handle_list(
         *by_type.entry(component.component_type.clone()).or_insert(0) += 1;
     }
 
+    let elapsed = timer.elapsed();
     Ok(json!({
         "ok": true,
         "command": "list",
         "mode": "language_summary",
+        "elapsed_secs": elapsed.as_secs_f64(),
         "language": language,
         "component_counts": by_type
     }))
@@ -431,6 +539,7 @@ fn handle_list(
 
 fn handle_deps(root: PathBuf, component_id: String, depth: Option<usize>) -> Result<Value> {
     let config = LimeConfig::load_or_create(&root)?;
+    let timer = std::time::Instant::now();
     let index = storage::load_index_or_empty(&root, &config)?;
     let effective_depth = depth.unwrap_or(config.default_dependency_depth);
 
@@ -443,9 +552,12 @@ fn handle_deps(root: PathBuf, component_id: String, depth: Option<usize>) -> Res
     let matrix = deps::dependency_tree(&index, &component_id, effective_depth)
         .ok_or_else(|| anyhow!("component not found: {component_id}"))?;
 
+    let elapsed = timer.elapsed();
+
     Ok(json!({
         "ok": true,
         "command": "deps",
+        "elapsed_secs": elapsed.as_secs_f64(),
         "component": root_component,
         "dependency_matrix": matrix
     }))
@@ -540,11 +652,21 @@ fn is_component_type_filter(value: &str) -> bool {
 }
 
 fn summarize_index(index: &IndexData) -> Value {
+    let mut breakdown = BTreeMap::<String, BTreeMap<String, usize>>::new();
+    for c in &index.components {
+        *breakdown
+            .entry(c.language.clone())
+            .or_default()
+            .entry(c.component_type.clone())
+            .or_insert(0) += 1;
+    }
+
     json!({
         "version": index.version,
         "generated_at": index.generated_at,
         "languages": index.languages,
         "file_count": index.files.len(),
-        "component_count": index.components.len()
+        "component_count": index.components.len(),
+        "component_breakdown": breakdown
     })
 }

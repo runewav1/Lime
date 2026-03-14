@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 use chrono::Utc;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
@@ -32,6 +33,9 @@ pub struct IndexData {
     pub files: Vec<IndexedFile>,
     /// Indexed component records.
     pub components: Vec<ComponentRecord>,
+    /// Optional search index: lowercase component name -> component indices.
+    #[serde(skip, default)]
+    pub search_index: Option<HashMap<String, Vec<usize>>>,
 }
 
 /// File-level index record.
@@ -101,6 +105,7 @@ impl IndexData {
             languages: Vec::new(),
             files: Vec::new(),
             components: Vec::new(),
+            search_index: None,
         }
     }
 
@@ -130,6 +135,20 @@ impl IndexData {
                     right.name.as_str(),
                 ))
         });
+
+        self.search_index = Some(self.build_search_index());
+    }
+
+    /// Builds a lowercase name -> component index lookup table.
+    pub fn build_search_index(&self) -> HashMap<String, Vec<usize>> {
+        let mut search_index = HashMap::new();
+        for (component_index, component) in self.components.iter().enumerate() {
+            search_index
+                .entry(component.name.to_ascii_lowercase())
+                .or_insert_with(Vec::new)
+                .push(component_index);
+        }
+        search_index
     }
 }
 
@@ -145,8 +164,13 @@ pub fn rebuild_index(root: &Path, config: &LimeConfig) -> Result<IndexData> {
     let mut index = IndexData::empty(root);
     let mut file_contents = HashMap::new();
 
-    for path in files {
-        if let Some(build) = index_single_file(root, &path)? {
+    let builds = files
+        .par_iter()
+        .map(|path| index_single_file(root, path))
+        .collect::<Vec<_>>();
+
+    for build in builds {
+        if let Some(build) = build? {
             file_contents.insert(build.file.path.clone(), build.content);
             index.files.push(build.file);
             index.components.extend(build.components);
@@ -174,6 +198,11 @@ pub fn add_file(
             .find(|entry| entry.path == filename)
             .map(|entry| entry.reason.clone())
             .unwrap_or_else(|| "file was not indexed".to_string());
+
+        if reason == "file hash unchanged" {
+            return Ok((next, report));
+        }
+
         bail!("add failed for `{filename}`: {reason}");
     }
 
@@ -234,21 +263,39 @@ pub fn sync_files(
             continue;
         }
 
-        match index_single_file(root, &absolute)? {
-            Some(build) => {
-                remove_path_from_index(&mut index, &build.file.path);
-                result.indexed.push(build.file.path.clone());
-                index.files.push(build.file);
-                index.components.extend(build.components);
-            }
-            None => {
-                remove_path_from_index(&mut index, &relative);
-                result.skipped.push(SkippedPath {
-                    path: raw.clone(),
-                    reason: "unsupported file extension".to_string(),
-                });
-            }
+        let Some(language) = detect_path_language(&absolute) else {
+            remove_path_from_index(&mut index, &relative);
+            result.skipped.push(SkippedPath {
+                path: raw.clone(),
+                reason: "unsupported file extension".to_string(),
+            });
+            continue;
+        };
+
+        let bytes = fs::read(&absolute)
+            .with_context(|| format!("failed reading file: {}", absolute.display()))?;
+        let file_hash = hash_bytes(&bytes);
+
+        let unchanged = index
+            .files
+            .iter()
+            .find(|file| file.path == relative)
+            .map(|file| file.file_hash == file_hash)
+            .unwrap_or(false);
+
+        if unchanged {
+            result.skipped.push(SkippedPath {
+                path: raw.clone(),
+                reason: "file hash unchanged".to_string(),
+            });
+            continue;
         }
+
+        let build = build_indexed_file(root, &absolute, language, &bytes)?;
+        remove_path_from_index(&mut index, &build.file.path);
+        result.indexed.push(build.file.path.clone());
+        index.files.push(build.file);
+        index.components.extend(build.components);
     }
 
     refresh_dependencies_from_disk(root, &mut index)?;
@@ -291,18 +338,23 @@ fn discover_supported_files(root: &Path, config: &LimeConfig) -> Result<Vec<Path
 }
 
 fn index_single_file(root: &Path, file_path: &Path) -> Result<Option<IndexedFileBuild>> {
-    let extension = file_path.extension().and_then(|value| value.to_str());
-    let Some(extension) = extension else {
-        return Ok(None);
-    };
-
-    let Some(language) = detect_language(extension) else {
+    let Some(language) = detect_path_language(file_path) else {
         return Ok(None);
     };
 
     let bytes = fs::read(file_path)
         .with_context(|| format!("failed reading file: {}", file_path.display()))?;
-    let content = String::from_utf8_lossy(&bytes).into_owned();
+
+    Ok(Some(build_indexed_file(root, file_path, language, &bytes)?))
+}
+
+fn build_indexed_file(
+    root: &Path,
+    file_path: &Path,
+    language: &str,
+    bytes: &[u8],
+) -> Result<IndexedFileBuild> {
+    let content = String::from_utf8_lossy(bytes).into_owned();
     let relative = relative_from_path(root, file_path)?;
     let parsed_components = parse_components(language, &content);
 
@@ -332,9 +384,9 @@ fn index_single_file(root: &Path, file_path: &Path) -> Result<Option<IndexedFile
         });
     }
 
-    let file_hash = blake3::hash(&bytes).to_hex().to_string();
+    let file_hash = hash_bytes(bytes);
 
-    Ok(Some(IndexedFileBuild {
+    Ok(IndexedFileBuild {
         file: IndexedFile {
             path: relative,
             language: language.to_string(),
@@ -343,7 +395,7 @@ fn index_single_file(root: &Path, file_path: &Path) -> Result<Option<IndexedFile
         },
         components: component_records,
         content,
-    }))
+    })
 }
 
 fn refresh_dependencies_from_disk(root: &Path, index: &mut IndexData) -> Result<()> {
@@ -354,7 +406,7 @@ fn refresh_dependencies_from_disk(root: &Path, index: &mut IndexData) -> Result<
         let absolute = root.join(Path::new(&file.path));
         match fs::read(&absolute) {
             Ok(bytes) => {
-                file.file_hash = blake3::hash(&bytes).to_hex().to_string();
+                file.file_hash = hash_bytes(&bytes);
                 let content = String::from_utf8_lossy(&bytes).into_owned();
                 file_contents.insert(file.path.clone(), content);
             }
@@ -493,4 +545,13 @@ fn relative_from_path(root: &Path, path: &Path) -> Result<String> {
 
 fn normalize_path_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+fn detect_path_language(path: &Path) -> Option<&'static str> {
+    let extension = path.extension().and_then(|value| value.to_str())?;
+    detect_language(extension)
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
 }
