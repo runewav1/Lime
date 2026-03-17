@@ -1,9 +1,9 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::LazyLock,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{annotations::Annotation, index::IndexData};
 
@@ -17,6 +17,10 @@ static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     ])
 });
 
+// ---------------------------------------------------------------------------
+// Match types
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchHit {
     pub component_id: String,
@@ -24,13 +28,16 @@ pub struct SearchHit {
     pub match_type: MatchType,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MatchType {
     Exact,
     Prefix,
     Substring,
+    Stem,
+    Fuzzy,
     Annotation,
+    Embedding,
 }
 
 impl MatchType {
@@ -39,7 +46,10 @@ impl MatchType {
             MatchType::Exact => "exact",
             MatchType::Prefix => "prefix",
             MatchType::Substring => "substring",
+            MatchType::Stem => "stem",
+            MatchType::Fuzzy => "fuzzy",
             MatchType::Annotation => "annotation",
+            MatchType::Embedding => "embedding",
         }
     }
 
@@ -48,17 +58,53 @@ impl MatchType {
             MatchType::Exact => 0,
             MatchType::Prefix => 1,
             MatchType::Substring => 2,
-            MatchType::Annotation => 3,
+            MatchType::Stem => 3,
+            MatchType::Fuzzy => 4,
+            MatchType::Annotation => 5,
+            MatchType::Embedding => 6,
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
+// ---------------------------------------------------------------------------
+// Unified search hit (multi-channel)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchChannel {
+    LexicalName,
+    TokenFuzzy,
+    StemMatch,
+    AnnotationText,
+    Embedding,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UnifiedSearchHit {
+    pub component_id: String,
+    pub score: f64,
+    pub match_type: MatchType,
+    pub channels: Vec<SearchChannel>,
+}
+
+// ---------------------------------------------------------------------------
+// Token index (in-memory, persistable)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchTokenIndex {
     pub token_to_components: HashMap<String, Vec<String>>,
     pub component_tokens: HashMap<String, Vec<String>>,
+    #[serde(default)]
     name_token_to_components: HashMap<String, Vec<String>>,
+    #[serde(default)]
     annotation_token_to_components: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    ngram_index: HashMap<String, Vec<String>>,
+    /// Stem → set of original tokens that share this stem.
+    #[serde(default)]
+    stem_index: HashMap<String, Vec<String>>,
 }
 
 impl SearchTokenIndex {
@@ -69,13 +115,251 @@ impl SearchTokenIndex {
     fn contains_component(&self, component_id: &str) -> bool {
         self.component_tokens.contains_key(component_id)
     }
+
+    fn candidate_tokens_for(&self, query_token: &str) -> HashSet<String> {
+        let trigrams = generate_trigrams(query_token);
+        if trigrams.is_empty() {
+            return self.token_to_components.keys().cloned().collect();
+        }
+
+        let mut candidates = HashSet::new();
+        for trigram in &trigrams {
+            if let Some(tokens) = self.ngram_index.get(trigram) {
+                for token in tokens {
+                    candidates.insert(token.clone());
+                }
+            }
+        }
+        candidates
+    }
+
+    fn stem_siblings_for(&self, query_token: &str) -> Vec<String> {
+        let query_stem = stem(query_token);
+        match self.stem_index.get(&query_stem) {
+            Some(siblings) => siblings
+                .iter()
+                .filter(|t| t.as_str() != query_token)
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
 }
+
+/// Serializable snapshot for persistence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PersistedTokenIndex {
+    pub version: u32,
+    pub token_to_components: BTreeMap<String, Vec<String>>,
+    pub component_tokens: BTreeMap<String, Vec<String>>,
+    pub name_token_to_components: BTreeMap<String, Vec<String>>,
+    pub annotation_token_to_components: BTreeMap<String, Vec<String>>,
+    pub ngram_index: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub stem_index: BTreeMap<String, Vec<String>>,
+}
+
+impl From<&SearchTokenIndex> for PersistedTokenIndex {
+    fn from(idx: &SearchTokenIndex) -> Self {
+        Self {
+            version: 1,
+            token_to_components: idx.token_to_components.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            component_tokens: idx.component_tokens.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            name_token_to_components: idx.name_token_to_components.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            annotation_token_to_components: idx.annotation_token_to_components.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            ngram_index: idx.ngram_index.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            stem_index: idx.stem_index.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        }
+    }
+}
+
+impl From<PersistedTokenIndex> for SearchTokenIndex {
+    fn from(p: PersistedTokenIndex) -> Self {
+        Self {
+            token_to_components: p.token_to_components.into_iter().collect(),
+            component_tokens: p.component_tokens.into_iter().collect(),
+            name_token_to_components: p.name_token_to_components.into_iter().collect(),
+            annotation_token_to_components: p.annotation_token_to_components.into_iter().collect(),
+            ngram_index: p.ngram_index.into_iter().collect(),
+            stem_index: p.stem_index.into_iter().collect(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trigram / n-gram generation
+// ---------------------------------------------------------------------------
+
+fn generate_trigrams(token: &str) -> Vec<String> {
+    if token.len() < 3 {
+        return Vec::new();
+    }
+    let bytes = token.as_bytes();
+    let mut trigrams = Vec::with_capacity(bytes.len().saturating_sub(2));
+    for window in bytes.windows(3) {
+        trigrams.push(String::from_utf8_lossy(window).into_owned());
+    }
+    trigrams.sort();
+    trigrams.dedup();
+    trigrams
+}
+
+// ---------------------------------------------------------------------------
+// Lightweight English suffix stemmer
+// ---------------------------------------------------------------------------
+
+pub fn stem(word: &str) -> String {
+    if word.len() < 4 {
+        return word.to_string();
+    }
+
+    let mut s = word.to_string();
+
+    // Plural / verb forms: highest specificity first
+    if s.ends_with("nesses") {
+        s.truncate(s.len() - 6);
+    } else if s.ends_with("ities") {
+        s.truncate(s.len() - 5);
+        s.push_str("ity");
+    } else if s.ends_with("ments") {
+        s.truncate(s.len() - 5);
+        s.push_str("ment");
+    } else if s.ends_with("ations") {
+        s.truncate(s.len() - 6);
+        s.push_str("ation");
+    } else if s.ends_with("ences") {
+        s.truncate(s.len() - 5);
+        s.push_str("ence");
+    } else if s.ends_with("ances") {
+        s.truncate(s.len() - 5);
+        s.push_str("ance");
+    } else if s.ends_with("ables") {
+        s.truncate(s.len() - 5);
+        s.push_str("able");
+    } else if s.ends_with("ibles") {
+        s.truncate(s.len() - 5);
+        s.push_str("ible");
+    } else if s.ends_with("iers") {
+        s.truncate(s.len() - 4);
+        s.push_str("ier");
+    } else if s.ends_with("ious") || s.ends_with("eous") {
+        // keep as-is (precious, gorgeous)
+    } else if s.ends_with("ies") && s.len() > 4 {
+        s.truncate(s.len() - 3);
+        s.push('y');
+    } else if s.ends_with("ness") && s.len() > 5 {
+        s.truncate(s.len() - 4);
+    } else if s.ends_with("ment") && s.len() > 5 {
+        s.truncate(s.len() - 4);
+    } else if s.ends_with("able") && s.len() > 5 {
+        s.truncate(s.len() - 4);
+    } else if s.ends_with("ible") && s.len() > 5 {
+        s.truncate(s.len() - 4);
+    } else if s.ends_with("tion") || s.ends_with("sion") {
+        // keep: these are root forms
+    } else if s.ends_with("ence") || s.ends_with("ance") {
+        // keep: these are root forms (dependence, performance)
+    } else if s.ends_with("ings") && s.len() > 5 {
+        s.truncate(s.len() - 4);
+    } else if s.ends_with("ers") && s.len() > 4 {
+        s.truncate(s.len() - 3);
+    } else if s.ends_with("ing") && s.len() > 4 {
+        s.truncate(s.len() - 3);
+        // handle doubling: "running" → "runn" → just check trailing double
+        let bytes = s.as_bytes();
+        if bytes.len() >= 2 && bytes[bytes.len() - 1] == bytes[bytes.len() - 2] {
+            s.pop();
+        }
+    } else if s.ends_with("ed") && s.len() > 4 && !s.ends_with("eed") {
+        s.truncate(s.len() - 2);
+        let bytes = s.as_bytes();
+        if bytes.len() >= 2 && bytes[bytes.len() - 1] == bytes[bytes.len() - 2] {
+            s.pop();
+        }
+    } else if s.ends_with("er") && s.len() > 4 && !s.ends_with("eer") {
+        s.truncate(s.len() - 2);
+    } else if s.ends_with("ly") && s.len() > 4 {
+        s.truncate(s.len() - 2);
+    } else if s.ends_with("es") && s.len() > 4 {
+        // dependencies → dependenci → apply 'ies' rule won't catch it since we
+        // already went past that branch; handle the common case
+        s.truncate(s.len() - 2);
+        if s.ends_with("ci") {
+            s.truncate(s.len() - 1);
+            s.push('y');
+        } else if s.ends_with("ss") || s.ends_with("sh") || s.ends_with("ch") || s.ends_with("x") {
+            // buses, crashes, etc — put the 'es' back (it's the root form w/ es)
+            s.push_str("es");
+        }
+    } else if s.ends_with('s') && s.len() > 4 && !s.ends_with("ss") {
+        s.pop();
+    }
+
+    if s.ends_with('e') && s.len() > 4 {
+        s.pop();
+    }
+
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Edit distance (Damerau-Levenshtein, bounded)
+// ---------------------------------------------------------------------------
+
+fn edit_distance(a: &str, b: &str, max: usize) -> Option<usize> {
+    let a_len = a.len();
+    let b_len = b.len();
+    if a_len.abs_diff(b_len) > max {
+        return None;
+    }
+
+    let mut prev = vec![0usize; b_len + 1];
+    let mut curr = vec![0usize; b_len + 1];
+
+    for j in 0..=b_len {
+        prev[j] = j;
+    }
+
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+
+    for i in 1..=a_len {
+        curr[0] = i;
+        let mut min_in_row = curr[0];
+        for j in 1..=b_len {
+            let cost = if a_bytes[i - 1] == b_bytes[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1)
+                .min(curr[j - 1] + 1)
+                .min(prev[j - 1] + cost);
+            min_in_row = min_in_row.min(curr[j]);
+        }
+        if min_in_row > max {
+            return None;
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    let distance = prev[b_len];
+    if distance <= max {
+        Some(distance)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Match candidate
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
 struct MatchCandidate {
     score: f64,
     match_type: MatchType,
 }
+
+// ---------------------------------------------------------------------------
+// Tokenization
+// ---------------------------------------------------------------------------
 
 pub fn tokenize_name(name: &str) -> Vec<String> {
     let trimmed = name.trim();
@@ -123,6 +407,10 @@ pub fn tokenize_content(content: &str) -> Vec<String> {
     tokens
 }
 
+// ---------------------------------------------------------------------------
+// Token index construction
+// ---------------------------------------------------------------------------
+
 pub fn build_token_index(index: &IndexData, annotations: &[Annotation]) -> SearchTokenIndex {
     let valid_component_ids = index
         .components
@@ -150,22 +438,69 @@ pub fn build_token_index(index: &IndexData, annotations: &[Annotation]) -> Searc
             continue;
         }
 
+        let mut ann_tokens = tokenize_content(&annotation.content);
+        for tag in &annotation.tags {
+            let tag_lower = tag.to_ascii_lowercase();
+            if !ann_tokens.contains(&tag_lower) {
+                ann_tokens.push(tag_lower);
+            }
+        }
+
         add_tokens(
             &annotation.hash_id,
-            tokenize_content(&annotation.content),
+            ann_tokens,
             &mut token_to_components,
             &mut component_tokens,
             &mut annotation_token_to_components,
         );
     }
 
+    let finalized_ttc = finalize_index(token_to_components);
+
+    let ngram_index = build_ngram_index(&finalized_ttc);
+    let stem_index = build_stem_index(&finalized_ttc);
+
     SearchTokenIndex {
-        token_to_components: finalize_index(token_to_components),
+        token_to_components: finalized_ttc,
         component_tokens: finalize_index(component_tokens),
         name_token_to_components: finalize_index(name_token_to_components),
         annotation_token_to_components: finalize_index(annotation_token_to_components),
+        ngram_index,
+        stem_index,
     }
 }
+
+fn build_ngram_index(token_to_components: &HashMap<String, Vec<String>>) -> HashMap<String, Vec<String>> {
+    let mut ngram_map: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for token in token_to_components.keys() {
+        for trigram in generate_trigrams(token) {
+            ngram_map.entry(trigram).or_default().insert(token.clone());
+        }
+    }
+    ngram_map
+        .into_iter()
+        .map(|(k, v)| (k, v.into_iter().collect()))
+        .collect()
+}
+
+fn build_stem_index(token_to_components: &HashMap<String, Vec<String>>) -> HashMap<String, Vec<String>> {
+    let mut stem_map: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for token in token_to_components.keys() {
+        if token.len() >= 3 {
+            let s = stem(token);
+            stem_map.entry(s).or_default().insert(token.clone());
+        }
+    }
+    stem_map
+        .into_iter()
+        .filter(|(_, tokens)| tokens.len() >= 1)
+        .map(|(k, v)| (k, v.into_iter().collect()))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzy search (ngram-accelerated)
+// ---------------------------------------------------------------------------
 
 pub fn fuzzy_search(token_index: &SearchTokenIndex, query: &str) -> Vec<SearchHit> {
     let query_tokens = tokenize_name(query);
@@ -179,9 +514,23 @@ pub fn fuzzy_search(token_index: &SearchTokenIndex, query: &str) -> Vec<SearchHi
     for query_token in query_tokens {
         let mut token_matches = HashMap::<String, MatchCandidate>::new();
 
-        for (index_token, component_ids) in token_index.all_tokens() {
-            let name_candidate = name_match(index_token, &query_token);
-            let annotation_candidate = if index_token.contains(&query_token) {
+        let candidates = token_index.candidate_tokens_for(&query_token);
+        let scan_tokens: Box<dyn Iterator<Item = (&String, &Vec<String>)>> = if candidates.is_empty() {
+            Box::new(token_index.all_tokens())
+        } else {
+            Box::new(
+                candidates.iter().filter_map(|tok| {
+                    token_index
+                        .token_to_components
+                        .get_key_value(tok)
+                        .map(|(k, v)| (k, v))
+                })
+            )
+        };
+
+        for (index_token, component_ids) in scan_tokens {
+            let name_candidate = name_match_with_fuzzy(index_token, &query_token);
+            let annotation_candidate = if index_token.contains(query_token.as_str()) {
                 Some(MatchCandidate {
                     score: 0.3,
                     match_type: MatchType::Annotation,
@@ -217,6 +566,34 @@ pub fn fuzzy_search(token_index: &SearchTokenIndex, query: &str) -> Vec<SearchHi
             }
         }
 
+        // Stem-based matching: find sibling tokens that share the same stem
+        let stem_siblings = token_index.stem_siblings_for(&query_token);
+        for sibling_token in &stem_siblings {
+            if let Some(component_ids) = token_index.token_to_components.get(sibling_token) {
+                let stem_score = stem_similarity_score(&query_token, sibling_token);
+                let candidate = MatchCandidate {
+                    score: stem_score,
+                    match_type: MatchType::Stem,
+                };
+                for component_id in component_ids {
+                    if !token_index.contains_component(component_id) {
+                        continue;
+                    }
+                    if token_has_component(
+                        &token_index.name_token_to_components,
+                        sibling_token,
+                        component_id,
+                    ) || token_has_component(
+                        &token_index.annotation_token_to_components,
+                        sibling_token,
+                        component_id,
+                    ) {
+                        update_best_match(&mut token_matches, component_id, candidate);
+                    }
+                }
+            }
+        }
+
         for (component_id, candidate) in token_matches {
             *total_scores.entry(component_id.clone()).or_insert(0.0) += candidate.score;
             update_best_match(&mut best_match_types, &component_id, candidate);
@@ -244,6 +621,80 @@ pub fn fuzzy_search(token_index: &SearchTokenIndex, query: &str) -> Vec<SearchHi
 
     hits
 }
+
+// ---------------------------------------------------------------------------
+// Merge multiple search channels into unified hits
+// ---------------------------------------------------------------------------
+
+pub fn merge_search_hits(
+    lexical: &[SearchHit],
+    fuzzy: &[SearchHit],
+    embedding: &[SearchHit],
+) -> Vec<UnifiedSearchHit> {
+    let mut map: HashMap<String, (f64, MatchType, Vec<SearchChannel>)> = HashMap::new();
+
+    for hit in lexical {
+        let entry = map.entry(hit.component_id.clone()).or_insert((0.0, MatchType::Exact, Vec::new()));
+        entry.0 += hit.score * 2.0;
+        if hit.match_type.rank() < entry.1.rank() {
+            entry.1 = hit.match_type;
+        }
+        if !entry.2.contains(&SearchChannel::LexicalName) {
+            entry.2.push(SearchChannel::LexicalName);
+        }
+    }
+
+    for hit in fuzzy {
+        let entry = map.entry(hit.component_id.clone()).or_insert((0.0, hit.match_type, Vec::new()));
+        entry.0 += hit.score;
+        if hit.match_type.rank() < entry.1.rank() {
+            entry.1 = hit.match_type;
+        }
+        let channel = match hit.match_type {
+            MatchType::Annotation => SearchChannel::AnnotationText,
+            MatchType::Stem => SearchChannel::StemMatch,
+            _ => SearchChannel::TokenFuzzy,
+        };
+        if !entry.2.contains(&channel) {
+            entry.2.push(channel);
+        }
+    }
+
+    for hit in embedding {
+        let entry = map.entry(hit.component_id.clone()).or_insert((0.0, hit.match_type, Vec::new()));
+        entry.0 += hit.score;
+        if hit.match_type.rank() < entry.1.rank() {
+            entry.1 = hit.match_type;
+        }
+        if !entry.2.contains(&SearchChannel::Embedding) {
+            entry.2.push(SearchChannel::Embedding);
+        }
+    }
+
+    let mut results: Vec<UnifiedSearchHit> = map
+        .into_iter()
+        .map(|(component_id, (score, match_type, channels))| UnifiedSearchHit {
+            component_id,
+            score,
+            match_type,
+            channels,
+        })
+        .collect();
+
+    results.sort_by(|a, b| {
+        a.match_type
+            .rank()
+            .cmp(&b.match_type.rank())
+            .then(b.score.total_cmp(&a.score))
+            .then(a.component_id.cmp(&b.component_id))
+    });
+
+    results
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
 
 fn push_name_chunk(chunk: &str, tokens: &mut Vec<String>) {
     for part in split_identifier_chunk(chunk) {
@@ -366,6 +817,47 @@ fn name_match(index_token: &str, query_token: &str) -> Option<MatchCandidate> {
     }
 }
 
+fn name_match_with_fuzzy(index_token: &str, query_token: &str) -> Option<MatchCandidate> {
+    if let Some(candidate) = name_match(index_token, query_token) {
+        return Some(candidate);
+    }
+
+    let max_dist = match query_token.len() {
+        0..=2 => return None,
+        3..=5 => 1,
+        _ => 2,
+    };
+
+    if let Some(dist) = edit_distance(index_token, query_token, max_dist) {
+        let max_len = index_token.len().max(query_token.len()) as f64;
+        let similarity = 1.0 - (dist as f64 / max_len);
+        Some(MatchCandidate {
+            score: 0.2 * similarity,
+            match_type: MatchType::Fuzzy,
+        })
+    } else {
+        None
+    }
+}
+
+fn stem_similarity_score(query_token: &str, sibling_token: &str) -> f64 {
+    let query_stem = stem(query_token);
+    let sibling_stem = stem(sibling_token);
+    if query_stem != sibling_stem {
+        return 0.0;
+    }
+
+    let shared_prefix = query_token
+        .chars()
+        .zip(sibling_token.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let max_len = query_token.len().max(sibling_token.len());
+    let prefix_ratio = shared_prefix as f64 / max_len as f64;
+
+    0.35 + (0.25 * prefix_ratio)
+}
+
 fn update_best_match(
     matches: &mut HashMap<String, MatchCandidate>,
     component_id: &str,
@@ -393,12 +885,19 @@ fn token_has_component(
         .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
-    use super::{build_token_index, fuzzy_search, tokenize_content, tokenize_name, MatchType};
+    use super::{
+        build_token_index, edit_distance, fuzzy_search, generate_trigrams, name_match_with_fuzzy,
+        tokenize_content, tokenize_name, MatchType, PersistedTokenIndex,
+    };
     use crate::{
         annotations::Annotation,
-        index::{ComponentRecord, IndexData},
+        index::{ComponentRecord, DeathEvidence, DeathStatus, IndexData},
     };
 
     #[test]
@@ -456,6 +955,7 @@ mod tests {
             component_type: "fn".to_string(),
             component_name: "file_hash".to_string(),
             content: "Searchable **annotation** details".to_string(),
+            tags: Vec::new(),
             created_at: "2026-03-17T00:00:00Z".to_string(),
             updated_at: "2026-03-17T00:00:00Z".to_string(),
         }];
@@ -479,6 +979,8 @@ mod tests {
         assert!(file_tokens.contains(&"hash".to_string()));
         assert!(file_tokens.contains(&"searchable".to_string()));
         assert!(file_tokens.contains(&"annotation".to_string()));
+
+        assert!(!token_index.ngram_index.is_empty());
     }
 
     #[test]
@@ -494,6 +996,7 @@ mod tests {
             component_type: "fn".to_string(),
             component_name: "notes".to_string(),
             content: "OAuth callback handling details".to_string(),
+            tags: Vec::new(),
             created_at: "2026-03-17T00:00:00Z".to_string(),
             updated_at: "2026-03-17T00:00:00Z".to_string(),
         }];
@@ -532,6 +1035,7 @@ mod tests {
             component_type: "fn".to_string(),
             component_name: "notes".to_string(),
             content: "Parse behavior overview".to_string(),
+            tags: Vec::new(),
             created_at: "2026-03-17T00:00:00Z".to_string(),
             updated_at: "2026-03-17T00:00:00Z".to_string(),
         }];
@@ -546,6 +1050,48 @@ mod tests {
                 .filter(|hit| hit.component_id == "fn-parser")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn trigram_generation_produces_expected_ngrams() {
+        let trigrams = generate_trigrams("parse");
+        assert!(trigrams.contains(&"par".to_string()));
+        assert!(trigrams.contains(&"ars".to_string()));
+        assert!(trigrams.contains(&"rse".to_string()));
+        assert_eq!(trigrams.len(), 3);
+
+        assert!(generate_trigrams("ab").is_empty());
+    }
+
+    #[test]
+    fn edit_distance_computes_correctly() {
+        assert_eq!(edit_distance("kitten", "sitting", 3), Some(3));
+        assert_eq!(edit_distance("abc", "abc", 0), Some(0));
+        assert_eq!(edit_distance("abc", "abd", 1), Some(1));
+        assert_eq!(edit_distance("abc", "xyz", 2), None);
+    }
+
+    #[test]
+    fn fuzzy_match_type_catches_typos() {
+        let candidate = name_match_with_fuzzy("authenticate", "authentcate");
+        assert!(candidate.is_some());
+        let c = candidate.unwrap();
+        assert_eq!(c.match_type, MatchType::Fuzzy);
+        assert!(c.score > 0.0);
+    }
+
+    #[test]
+    fn token_index_roundtrips_through_persistence() {
+        let index = sample_index(vec![component("fn-a", "hello")]);
+        let token_index = build_token_index(&index, &[]);
+        let persisted = PersistedTokenIndex::from(&token_index);
+        let json = serde_json::to_string(&persisted).unwrap();
+        let restored: PersistedTokenIndex = serde_json::from_str(&json).unwrap();
+        let rehydrated = super::SearchTokenIndex::from(restored);
+        assert_eq!(
+            token_index.token_to_components.get("hello"),
+            rehydrated.token_to_components.get("hello")
         );
     }
 
@@ -573,10 +1119,66 @@ mod tests {
             uses_before: Vec::new(),
             used_by_after: Vec::new(),
             batman: false,
+            death_status: DeathStatus::Alive,
+            death_evidence: DeathEvidence::default(),
         }
     }
 
     fn assert_close(actual: f64, expected: f64) {
         assert!((actual - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn stem_reduces_common_suffixes() {
+        use super::stem;
+        assert_eq!(stem("dependencies"), stem("dependency"));
+        assert_eq!(stem("parsing"), stem("parse"));
+        assert_eq!(stem("parsers"), stem("parser"));
+        assert_eq!(stem("components"), stem("component"));
+        assert_eq!(stem("running"), stem("run"));
+        assert_eq!(stem("authenticated"), stem("authenticat"));
+        assert_eq!(stem("searchable"), stem("search"));
+        assert_eq!(stem("abilities"), stem("ability"));
+        assert_eq!(stem("performances"), stem("performance"));
+    }
+
+    #[test]
+    fn stem_index_groups_related_tokens() {
+        let index = sample_index(vec![
+            component("fn-dep", "dependency"),
+            component("fn-deps", "dependencies"),
+            component("fn-parse", "parse"),
+            component("fn-parser", "parser"),
+        ]);
+        let token_index = build_token_index(&index, &[]);
+
+        let dep_stem = super::stem("dependency");
+        let siblings = token_index.stem_index.get(&dep_stem);
+        assert!(siblings.is_some(), "stem index should contain '{dep_stem}'");
+        let sibs = siblings.unwrap();
+        assert!(sibs.contains(&"dependency".to_string()));
+        assert!(sibs.contains(&"dependencies".to_string()));
+    }
+
+    #[test]
+    fn stem_search_finds_morphological_variants() {
+        let index = sample_index(vec![
+            component("fn-dep", "resolveDependency"),
+            component("fn-deps", "loadDependencies"),
+            component("fn-unrelated", "handleAuth"),
+        ]);
+        let token_index = build_token_index(&index, &[]);
+
+        let hits = fuzzy_search(&token_index, "dependency");
+        let hit_ids: Vec<&str> = hits.iter().map(|h| h.component_id.as_str()).collect();
+        assert!(hit_ids.contains(&"fn-dep"), "should find resolveDependency");
+        assert!(hit_ids.contains(&"fn-deps"), "should find loadDependencies via stem");
+
+        let deps_hit = hits.iter().find(|h| h.component_id == "fn-deps").unwrap();
+        assert!(
+            deps_hit.match_type == MatchType::Stem || deps_hit.match_type == MatchType::Prefix
+                || deps_hit.match_type == MatchType::Substring,
+            "match for loadDependencies should be stem, prefix, or substring"
+        );
     }
 }

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::{
+    annotations,
     batman,
     config::LimeConfig,
     deps,
@@ -52,6 +53,49 @@ pub struct IndexedFile {
     pub component_ids: Vec<String>,
 }
 
+/// Tiered classification of component liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeathStatus {
+    Alive,
+    MaybeDead,
+    ProbablyDead,
+    DefinitelyDead,
+}
+
+impl Default for DeathStatus {
+    fn default() -> Self {
+        Self::Alive
+    }
+}
+
+impl DeathStatus {
+    pub fn is_dead(self) -> bool {
+        self != Self::Alive
+    }
+}
+
+/// Structured reason why a component was classified at a given tier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeathReason {
+    NotReachableFromSeeds,
+    AllParentsDeadCandidates,
+    NoDependencyEdges,
+    NoExternalSymbolReferences,
+    NoLocalScopeReferences,
+    ScanCapped,
+    AnnotatedKeep,
+    FoundExternalRef { file: String, count: usize },
+    RescuedByAnnotation,
+}
+
+/// Evidence bundle attached to a death classification.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeathEvidence {
+    pub reasons: Vec<DeathReason>,
+}
+
 /// Component-level index record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentRecord {
@@ -74,9 +118,15 @@ pub struct ComponentRecord {
     pub uses_before: Vec<String>,
     /// IDs of components that reference this component.
     pub used_by_after: Vec<String>,
-    /// Whether this component is flagged as dead code (disconnected from the main graph).
+    /// Compatibility flag: true when `death_status != Alive`.
     #[serde(default)]
     pub batman: bool,
+    /// Tiered death classification.
+    #[serde(default)]
+    pub death_status: DeathStatus,
+    /// Structured evidence for the death classification.
+    #[serde(default)]
+    pub death_evidence: DeathEvidence,
 }
 
 /// Result metadata for partial file updates.
@@ -182,7 +232,8 @@ pub fn rebuild_index(root: &Path, config: &LimeConfig) -> Result<IndexData> {
     }
 
     deps::populate_dependencies(&mut index, &file_contents);
-    batman::detect_batman(&mut index, &file_contents);
+    let all_annotations = annotations::list_annotations(root).unwrap_or_default();
+    batman::detect_batman_full(&mut index, &file_contents, &config.death_seeds, &all_annotations);
     index.refresh_metadata();
     Ok(index)
 }
@@ -215,11 +266,16 @@ pub fn add_file(
 }
 
 /// Removes a single file from the index and refreshes dependencies.
-pub fn remove_file(root: &Path, filename: &str, mut index: IndexData) -> Result<(IndexData, bool)> {
+pub fn remove_file(
+    root: &Path,
+    config: &LimeConfig,
+    filename: &str,
+    mut index: IndexData,
+) -> Result<(IndexData, bool)> {
     let relative = relative_from_input(root, filename)?;
     let removed = remove_path_from_index(&mut index, &relative);
     if removed {
-        refresh_dependencies_from_disk(root, &mut index)?;
+        refresh_dependencies_from_disk(root, config, &mut index)?;
     }
     Ok((index, removed))
 }
@@ -303,7 +359,7 @@ pub fn sync_files(
         index.components.extend(build.components);
     }
 
-    refresh_dependencies_from_disk(root, &mut index)?;
+    refresh_dependencies_from_disk(root, config, &mut index)?;
     Ok((index, result))
 }
 
@@ -387,6 +443,8 @@ fn build_indexed_file(
             uses_before: Vec::new(),
             used_by_after: Vec::new(),
             batman: false,
+            death_status: DeathStatus::Alive,
+            death_evidence: DeathEvidence::default(),
         });
     }
 
@@ -404,7 +462,11 @@ fn build_indexed_file(
     })
 }
 
-fn refresh_dependencies_from_disk(root: &Path, index: &mut IndexData) -> Result<()> {
+fn refresh_dependencies_from_disk(
+    root: &Path,
+    config: &LimeConfig,
+    index: &mut IndexData,
+) -> Result<()> {
     let mut file_contents = HashMap::new();
     let mut missing_paths = Vec::new();
 
@@ -427,7 +489,8 @@ fn refresh_dependencies_from_disk(root: &Path, index: &mut IndexData) -> Result<
     }
 
     deps::populate_dependencies(index, &file_contents);
-    batman::detect_batman(index, &file_contents);
+    let all_annotations = annotations::list_annotations(root).unwrap_or_default();
+    batman::detect_batman_full(index, &file_contents, &config.death_seeds, &all_annotations);
     index.refresh_metadata();
     Ok(())
 }

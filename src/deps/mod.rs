@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::Serialize;
 
-use crate::index::{ComponentRecord, IndexData};
+use crate::index::{ComponentRecord, DeathStatus, IndexData};
 
 /// Dependency tree output from `lime deps`.
 #[derive(Debug, Clone, Serialize)]
@@ -37,6 +37,8 @@ pub struct DependencyNode {
     pub depth: usize,
     /// Whether this component is flagged as dead code.
     pub batman: bool,
+    /// Tiered death classification.
+    pub death_status: DeathStatus,
 }
 
 /// Populates dependency links (`uses_before`, `used_by_after`) for all components.
@@ -251,6 +253,7 @@ fn walk_direction(
                 start_line: component.start_line,
                 depth: current_depth,
                 batman: component.batman,
+                death_status: component.death_status,
             });
 
             let next = match direction {

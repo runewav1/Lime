@@ -16,8 +16,18 @@ pub struct Annotation {
     pub component_type: String,
     pub component_name: String,
     pub content: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl Annotation {
+    pub fn has_keep_tag(&self) -> bool {
+        self.tags
+            .iter()
+            .any(|t| matches!(t.as_str(), "keep" | "public_api" | "entrypoint"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +35,8 @@ struct AnnotationFrontmatter {
     hash_id: String,
     component_type: String,
     component_name: String,
+    #[serde(default)]
+    tags: Vec<String>,
     created_at: String,
     updated_at: String,
 }
@@ -59,6 +71,7 @@ pub fn save_annotation(root: &Path, annotation: &Annotation) -> Result<()> {
         hash_id,
         component_type,
         component_name: annotation.component_name.clone(),
+        tags: annotation.tags.clone(),
         created_at,
         updated_at,
     };
@@ -254,6 +267,7 @@ fn parse_annotation_file(raw: &str) -> Result<Annotation> {
         component_type: frontmatter.component_type,
         component_name: frontmatter.component_name,
         content,
+        tags: frontmatter.tags,
         created_at: frontmatter.created_at,
         updated_at: frontmatter.updated_at,
     })

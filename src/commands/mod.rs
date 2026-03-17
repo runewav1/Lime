@@ -11,9 +11,11 @@ use serde_json::{json, Value};
 
 use crate::{
     annotations,
+    chunk,
     config::LimeConfig,
     deps,
-    index::{self, ComponentRecord, IndexData},
+    embeddings,
+    index::{self, ComponentRecord, DeathStatus, IndexData},
     search::{self, MatchType},
     storage,
 };
@@ -53,10 +55,14 @@ pub fn run() -> Result<()> {
     };
 
     let result = match cli.command {
-        Commands::Sync { files } => handle_sync(root, files),
+        Commands::Sync { files, no_embeddings } => handle_sync(root, files, no_embeddings),
         Commands::Add { filename } => handle_add(root, filename),
         Commands::Remove { filename } => handle_remove(root, filename),
-        Commands::Search { terms, fuzzy } => handle_search(root, terms, fuzzy),
+        Commands::Search {
+            terms,
+            fuzzy,
+            semantic,
+        } => handle_search(root, terms, fuzzy, semantic),
         Commands::List {
             language,
             component_type,
@@ -67,6 +73,7 @@ pub fn run() -> Result<()> {
             depth,
         } => handle_deps(root, component_id, depth),
         Commands::Annotate { action } => handle_annotate(root, action),
+        Commands::Config { action } => handle_config(root, action),
     };
 
     match result {
@@ -145,6 +152,9 @@ enum Commands {
     Sync {
         /// Specific files to re-index. Omit to rebuild the entire index.
         files: Vec<String>,
+        /// Skip embedding generation for this sync, even if enabled in config.
+        #[arg(long = "no-embeddings")]
+        no_embeddings: bool,
     },
     /// Add a single file to the index.
     ///
@@ -187,6 +197,9 @@ enum Commands {
         /// Enable fuzzy matching with token-based and annotation search.
         #[arg(long)]
         fuzzy: bool,
+        /// Enable semantic (embedding-based) search.
+        #[arg(long)]
+        semantic: bool,
     },
     /// List indexed languages or components.
     ///
@@ -242,6 +255,20 @@ enum Commands {
         #[command(subcommand)]
         action: AnnotateAction,
     },
+    /// Inspect and update Lime configuration.
+    ///
+    /// This reads and writes `.lime/lime.json` in the current repository.
+    /// Use `lime config show` to view the full config, and the other
+    /// subcommands to update specific sections without losing defaults.
+    ///
+    /// Examples:
+    ///   "lime config show"
+    ///   "lime config embeddings --enabled true --provider ollama --model-id nomic-embed-text"
+    ///   "lime config death-seeds --seed-file src/main.rs --seed-name main --seed-type fn"
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -260,6 +287,9 @@ enum AnnotateAction {
         /// Annotation content (markdown).
         #[arg(short = 'm', long = "message")]
         message: String,
+        /// Tags for the annotation (e.g. keep, public_api, entrypoint).
+        #[arg(short = 't', long = "tag")]
+        tags: Vec<String>,
     },
     /// Display an annotation for a component.
     ///
@@ -298,7 +328,78 @@ enum AnnotateAction {
     },
 }
 
-fn handle_sync(root: PathBuf, files: Vec<String>) -> Result<Value> {
+#[derive(Debug, Subcommand)]
+enum ConfigAction {
+    /// Show the current configuration from `.lime/lime.json`.
+    ///
+    /// This prints the full JSON so it can be inspected or piped to tools.
+    Show,
+
+    /// Update embedding configuration.
+    ///
+    /// Any flag you omit is left unchanged (or stays at its default if
+    /// never customized before). This lets you set only the pieces you
+    /// care about without rewriting the whole config.
+    ///
+    /// Examples:
+    ///   "lime config embeddings --enabled true --provider ollama --model-id nomic-embed-text"
+    ///   "lime config embeddings --provider remote --endpoint https://api.openai.com/v1/embeddings --model-id text-embedding-3-small"
+    Embeddings {
+        /// Enable or disable embedding generation.
+        #[arg(long)]
+        enabled: Option<bool>,
+        /// Provider type: "ollama", "llamacpp", or "remote".
+        #[arg(long)]
+        provider: Option<String>,
+        /// HTTP endpoint for the embedding service.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Embedding model identifier.
+        #[arg(long = "model-id")]
+        model_id: Option<String>,
+        /// Embedding vector dimensionality (0 = auto-detect).
+        #[arg(long)]
+        dimensions: Option<usize>,
+        /// Maximum texts per batch request.
+        #[arg(long)]
+        batch_size: Option<usize>,
+        /// HTTP timeout in seconds for embedding requests.
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
+
+    /// Update death seed configuration for the component death algorithm.
+    ///
+    /// Seed files / names / types are treated as always-alive roots.
+    /// Use the `--seed-*` flags to add new entries, and the `--clear-*`
+    /// flags to wipe existing lists entirely before adding.
+    ///
+    /// Examples:
+    ///   "lime config death-seeds --seed-file src/main.rs --seed-name main --seed-type fn"
+    ///   "lime config death-seeds --clear-seed-files --seed-file cmd/**"
+    DeathSeeds {
+        /// Add file path patterns whose components are always alive seeds.
+        #[arg(long = "seed-file")]
+        seed_files: Vec<String>,
+        /// Add component name patterns that are always alive seeds (exact match).
+        #[arg(long = "seed-name")]
+        seed_names: Vec<String>,
+        /// Add component types that are always alive seeds (e.g. "fn", "class").
+        #[arg(long = "seed-type")]
+        seed_types: Vec<String>,
+        /// Clear all existing seed file patterns before applying additions.
+        #[arg(long)]
+        clear_seed_files: bool,
+        /// Clear all existing seed name patterns before applying additions.
+        #[arg(long)]
+        clear_seed_names: bool,
+        /// Clear all existing seed type patterns before applying additions.
+        #[arg(long)]
+        clear_seed_types: bool,
+    },
+}
+
+fn handle_sync(root: PathBuf, files: Vec<String>, no_embeddings: bool) -> Result<Value> {
     let config = LimeConfig::load_or_create(&root)?;
 
     if files.is_empty() {
@@ -306,13 +407,19 @@ fn handle_sync(root: PathBuf, files: Vec<String>) -> Result<Value> {
         let index = index::rebuild_index(&root, &config)?;
         let elapsed = timer.elapsed();
         storage::save_index(&root, &config, &index)?;
-        return Ok(json!({
+        persist_token_index(&root, &index);
+
+        let embed_result = sync_embeddings_for_index(&root, &config, &index, no_embeddings);
+
+        let mut response = json!({
             "ok": true,
             "command": "sync",
             "scope": "full",
             "elapsed_secs": elapsed.as_secs_f64(),
             "index": summarize_index(&index)
-        }));
+        });
+        response["embeddings"] = embed_result;
+        return Ok(response);
     }
 
     let current = storage::load_index_or_empty(&root, &config)?;
@@ -320,8 +427,11 @@ fn handle_sync(root: PathBuf, files: Vec<String>) -> Result<Value> {
     let (updated, result) = index::sync_files(&root, &config, &files, current)?;
     let elapsed = timer.elapsed();
     storage::save_index(&root, &config, &updated)?;
+    persist_token_index(&root, &updated);
 
-    Ok(json!({
+    let embed_result = sync_embeddings_for_index(&root, &config, &updated, no_embeddings);
+
+    let mut response = json!({
         "ok": true,
         "command": "sync",
         "scope": "partial",
@@ -331,7 +441,9 @@ fn handle_sync(root: PathBuf, files: Vec<String>) -> Result<Value> {
         },
         "result": result,
         "index": summarize_index(&updated)
-    }))
+    });
+    response["embeddings"] = embed_result;
+    Ok(response)
 }
 
 fn handle_add(root: PathBuf, filename: String) -> Result<Value> {
@@ -358,7 +470,7 @@ fn handle_remove(root: PathBuf, filename: String) -> Result<Value> {
     let config = LimeConfig::load_or_create(&root)?;
     let current = storage::load_index_or_empty(&root, &config)?;
     let timer = std::time::Instant::now();
-    let (updated, removed) = index::remove_file(&root, &filename, current)?;
+    let (updated, removed) = index::remove_file(&root, &config, &filename, current)?;
     let elapsed = timer.elapsed();
     if removed {
         storage::save_index(&root, &config, &updated)?;
@@ -376,7 +488,113 @@ fn handle_remove(root: PathBuf, filename: String) -> Result<Value> {
     }))
 }
 
-fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value> {
+fn handle_config(root: PathBuf, action: ConfigAction) -> Result<Value> {
+    match action {
+        ConfigAction::Show => {
+            let config = LimeConfig::load_or_create(&root)?;
+            Ok(json!({
+                "ok": true,
+                "command": "config_show",
+                "config": config,
+            }))
+        }
+        ConfigAction::Embeddings {
+            enabled,
+            provider,
+            endpoint,
+            model_id,
+            dimensions,
+            batch_size,
+            timeout_secs,
+        } => {
+            let mut config = LimeConfig::load_or_create(&root)?;
+
+            if let Some(value) = enabled {
+                config.embeddings.enabled = value;
+            }
+            if let Some(value) = provider {
+                config.embeddings.provider = value;
+            }
+            if let Some(value) = endpoint {
+                config.embeddings.endpoint = value;
+            }
+            if let Some(value) = model_id {
+                config.embeddings.model_id = value;
+            }
+            if let Some(value) = dimensions {
+                config.embeddings.dimensions = value;
+            }
+            if let Some(value) = batch_size {
+                config.embeddings.batch_size = value;
+            }
+            if let Some(value) = timeout_secs {
+                config.embeddings.timeout_secs = value;
+            }
+
+            config.save(&root)?;
+            let embeddings = config.embeddings.clone();
+
+            Ok(json!({
+                "ok": true,
+                "command": "config_embeddings",
+                "embeddings": embeddings,
+            }))
+        }
+        ConfigAction::DeathSeeds {
+            seed_files,
+            seed_names,
+            seed_types,
+            clear_seed_files,
+            clear_seed_names,
+            clear_seed_types,
+        } => {
+            let mut config = LimeConfig::load_or_create(&root)?;
+
+            if clear_seed_files {
+                config.death_seeds.seed_files.clear();
+            }
+            if clear_seed_names {
+                config.death_seeds.seed_names.clear();
+            }
+            if clear_seed_types {
+                config.death_seeds.seed_types.clear();
+            }
+
+            if !seed_files.is_empty() {
+                for pattern in seed_files {
+                    if !config.death_seeds.seed_files.contains(&pattern) {
+                        config.death_seeds.seed_files.push(pattern);
+                    }
+                }
+            }
+            if !seed_names.is_empty() {
+                for name in seed_names {
+                    if !config.death_seeds.seed_names.contains(&name) {
+                        config.death_seeds.seed_names.push(name);
+                    }
+                }
+            }
+            if !seed_types.is_empty() {
+                for t in seed_types {
+                    if !config.death_seeds.seed_types.contains(&t) {
+                        config.death_seeds.seed_types.push(t);
+                    }
+                }
+            }
+
+            config.save(&root)?;
+            let seeds = config.death_seeds.clone();
+
+            Ok(json!({
+                "ok": true,
+                "command": "config_death_seeds",
+                "death_seeds": seeds,
+            }))
+        }
+    }
+}
+
+fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool, semantic: bool) -> Result<Value> {
     if terms.is_empty() {
         bail!("search requires at least one argument");
     }
@@ -484,7 +702,7 @@ fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value
             ))
     });
 
-    if !fuzzy {
+    if !fuzzy && !semantic {
         let elapsed = timer.elapsed();
         return Ok(json!({
             "ok": true,
@@ -492,6 +710,7 @@ fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value
             "elapsed_secs": elapsed.as_secs_f64(),
             "query": query,
             "fuzzy": false,
+            "semantic": false,
             "result_count": results.len(),
             "results": results
         }));
@@ -500,8 +719,19 @@ fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value
     let exact_ids: HashSet<String> = results.iter().map(|c| c.id.clone()).collect();
 
     let all_annotations = annotations::list_annotations(&root).unwrap_or_default();
-    let token_index = search::build_token_index(&index, &all_annotations);
-    let fuzzy_hits = search::fuzzy_search(&token_index, &query.query);
+    let token_index = storage::load_token_index(&root)?
+        .unwrap_or_else(|| search::build_token_index(&index, &all_annotations));
+    let fuzzy_hits = if fuzzy {
+        search::fuzzy_search(&token_index, &query.query)
+    } else {
+        Vec::new()
+    };
+
+    let semantic_hits = if semantic {
+        run_semantic_search(&root, &config, &query.query)?
+    } else {
+        Vec::new()
+    };
 
     let annotation_map: std::collections::HashMap<String, &annotations::Annotation> =
         all_annotations
@@ -545,7 +775,12 @@ fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value
         }
     }
 
-    for hit in &fuzzy_hits {
+    let all_extra_hits: Vec<&search::SearchHit> = fuzzy_hits
+        .iter()
+        .chain(semantic_hits.iter())
+        .collect();
+
+    for hit in all_extra_hits {
         if exact_ids.contains(&hit.component_id) {
             continue;
         }
@@ -621,7 +856,8 @@ fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value
         "command": "search",
         "elapsed_secs": elapsed.as_secs_f64(),
         "query": query,
-        "fuzzy": true,
+        "fuzzy": fuzzy,
+        "semantic": semantic,
         "result_count": results_json.len(),
         "results": results_json
     }))
@@ -778,6 +1014,7 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
         AnnotateAction::Add {
             component_id,
             message,
+            tags,
         } => {
             let component = index
                 .components
@@ -791,6 +1028,14 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
                 .as_ref()
                 .map(|a| a.created_at.clone())
                 .unwrap_or_else(|| now.clone());
+            let merged_tags = if tags.is_empty() {
+                existing
+                    .as_ref()
+                    .map(|a| a.tags.clone())
+                    .unwrap_or_default()
+            } else {
+                tags
+            };
 
             let (comp_type, _) = component_id
                 .split_once('-')
@@ -801,6 +1046,7 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
                 component_type: comp_type.to_string(),
                 component_name: component.name.clone(),
                 content: message.clone(),
+                tags: merged_tags,
                 created_at,
                 updated_at: now,
             };
@@ -817,6 +1063,7 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
                 "annotation": {
                     "hash_id": annotation.hash_id,
                     "content": annotation.content,
+                    "tags": annotation.tags,
                     "created_at": annotation.created_at,
                     "updated_at": annotation.updated_at
                 }
@@ -1016,6 +1263,22 @@ fn summarize_index(index: &IndexData) -> Value {
         .filter(|component| component.batman)
         .count();
 
+    let definitely_dead = index
+        .components
+        .iter()
+        .filter(|c| c.death_status == DeathStatus::DefinitelyDead)
+        .count();
+    let probably_dead = index
+        .components
+        .iter()
+        .filter(|c| c.death_status == DeathStatus::ProbablyDead)
+        .count();
+    let maybe_dead = index
+        .components
+        .iter()
+        .filter(|c| c.death_status == DeathStatus::MaybeDead)
+        .count();
+
     json!({
         "version": index.version,
         "generated_at": index.generated_at,
@@ -1023,8 +1286,115 @@ fn summarize_index(index: &IndexData) -> Value {
         "file_count": index.files.len(),
         "component_count": index.components.len(),
         "batman_count": batman_count,
+        "death_summary": {
+            "definitely_dead": definitely_dead,
+            "probably_dead": probably_dead,
+            "maybe_dead": maybe_dead,
+            "alive": index.components.len() - definitely_dead - probably_dead - maybe_dead
+        },
         "component_breakdown": breakdown
     })
+}
+
+fn run_semantic_search(
+    root: &std::path::Path,
+    config: &LimeConfig,
+    query: &str,
+) -> Result<Vec<search::SearchHit>> {
+    if !config.embeddings.enabled {
+        return Ok(Vec::new());
+    }
+
+    let provider = embeddings::create_provider(&config.embeddings)?;
+    let store = embeddings::load_embedding_store(root, provider.model_id())?;
+    let Some(store) = store else {
+        return Ok(Vec::new());
+    };
+
+    let query_vectors = provider.embed(&[query.to_string()])?;
+    let Some(query_vec) = query_vectors.into_iter().next() else {
+        return Ok(Vec::new());
+    };
+
+    Ok(embeddings::semantic_search(&store, &query_vec, 20))
+}
+
+fn persist_token_index(root: &std::path::Path, index: &IndexData) {
+    let all_annotations = annotations::list_annotations(root).unwrap_or_default();
+    let token_index = search::build_token_index(index, &all_annotations);
+    let _ = storage::save_token_index(root, &token_index);
+}
+
+fn sync_embeddings_for_index(
+    root: &std::path::Path,
+    config: &LimeConfig,
+    index: &IndexData,
+    no_embeddings: bool,
+) -> Value {
+    if no_embeddings {
+        return json!({ "enabled": config.embeddings.enabled, "status": "skipped" });
+    }
+    if !config.embeddings.enabled {
+        return json!({ "enabled": false, "status": "disabled" });
+    }
+
+    let embed_timer = std::time::Instant::now();
+
+    let file_contents = read_index_file_contents(root, index);
+    let chunks = chunk::extract_all_chunks(index, &file_contents);
+
+    let valid_ids: HashSet<String> = index.components.iter().map(|c| c.id.clone()).collect();
+
+    match embeddings::sync_embeddings(root, &config.embeddings, &chunks, &valid_ids) {
+        Ok(result) => {
+            let elapsed = embed_timer.elapsed();
+            let status = if result.failed_batches > 0 && result.batches_completed > 0 {
+                "partial"
+            } else if result.failed_batches > 0 && result.batches_completed == 0 {
+                "error"
+            } else {
+                "ok"
+            };
+            json!({
+                "enabled": true,
+                "status": status,
+                "elapsed_secs": elapsed.as_secs_f64(),
+                "total_components": result.total_components,
+                "chunks_extracted": chunks.len(),
+                "embedded": result.embedded,
+                "reused": result.reused,
+                "removed": result.removed,
+                "batches_total": result.batches_total,
+                "batches_completed": result.batches_completed,
+                "failed_batches": result.failed_batches,
+            })
+        }
+        Err(err) => {
+            let elapsed = embed_timer.elapsed();
+            json!({
+                "enabled": true,
+                "status": "error",
+                "elapsed_secs": elapsed.as_secs_f64(),
+                "chunks_extracted": chunks.len(),
+                "error": format!("{err:#}"),
+            })
+        }
+    }
+}
+
+fn read_index_file_contents(
+    root: &std::path::Path,
+    index: &IndexData,
+) -> std::collections::HashMap<String, String> {
+    let mut contents = std::collections::HashMap::new();
+    for file in &index.files {
+        let absolute = root.join(std::path::Path::new(&file.path));
+        if let Ok(bytes) = std::fs::read(&absolute) {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            contents.insert(file.path.clone(), text);
+        }
+    }
+    contents
 }
 
 fn truncate_preview(content: &str, max_len: usize) -> String {
