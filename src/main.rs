@@ -1,9 +1,13 @@
+mod annotations;
+#[allow(dead_code)]
+mod batman;
 mod commands;
 mod config;
 mod deps;
 mod format;
 mod index;
 mod parse;
+mod search;
 mod storage;
 
 fn main() {

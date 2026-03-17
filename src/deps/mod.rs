@@ -35,6 +35,8 @@ pub struct DependencyNode {
     pub start_line: usize,
     /// Relationship distance from root.
     pub depth: usize,
+    /// Whether this component is flagged as dead code.
+    pub batman: bool,
 }
 
 /// Populates dependency links (`uses_before`, `used_by_after`) for all components.
@@ -248,6 +250,7 @@ fn walk_direction(
                 file: component.file.clone(),
                 start_line: component.start_line,
                 depth: current_depth,
+                batman: component.batman,
             });
 
             let next = match direction {
@@ -295,7 +298,7 @@ fn walk_direction(
     deduped
 }
 
-fn contains_word(scope: &str, word: &str) -> bool {
+pub fn contains_word(scope: &str, word: &str) -> bool {
     if word.is_empty() {
         return false;
     }
@@ -422,7 +425,7 @@ fn is_dependency_target_type(component_type: &str) -> bool {
     )
 }
 
-fn is_import_like_type(component_type: &str) -> bool {
+pub fn is_import_like_type(component_type: &str) -> bool {
     matches!(component_type, "use" | "import" | "from")
 }
 

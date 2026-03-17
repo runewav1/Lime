@@ -10,9 +10,11 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::{
+    annotations,
     config::LimeConfig,
     deps,
     index::{self, ComponentRecord, IndexData},
+    search::{self, MatchType},
     storage,
 };
 
@@ -54,7 +56,7 @@ pub fn run() -> Result<()> {
         Commands::Sync { files } => handle_sync(root, files),
         Commands::Add { filename } => handle_add(root, filename),
         Commands::Remove { filename } => handle_remove(root, filename),
-        Commands::Search { terms } => handle_search(root, terms),
+        Commands::Search { terms, fuzzy } => handle_search(root, terms, fuzzy),
         Commands::List {
             language,
             component_type,
@@ -64,6 +66,7 @@ pub fn run() -> Result<()> {
             component_id,
             depth,
         } => handle_deps(root, component_id, depth),
+        Commands::Annotate { action } => handle_annotate(root, action),
     };
 
     match result {
@@ -177,10 +180,13 @@ enum Commands {
     ///   "lime search run"               search all languages
     ///   "lime search rust run"          filter by language
     ///   "lime search rust fn run"       filter by language and type
-    ///   "lime search python class Auth" filter by language and type
+    ///   "lime search --fuzzy auth"      fuzzy match on tokens and annotations
     Search {
         /// Query terms. Format: [language] [type] <query>
         terms: Vec<String>,
+        /// Enable fuzzy matching with token-based and annotation search.
+        #[arg(long)]
+        fuzzy: bool,
     },
     /// List indexed languages or components.
     ///
@@ -220,6 +226,75 @@ enum Commands {
         /// Maximum traversal depth (default: value from .lime/lime.json, usually 2).
         #[arg(long)]
         depth: Option<usize>,
+    },
+    /// Manage component annotations.
+    ///
+    /// Attach semantic notes to indexed components. Annotations persist
+    /// alongside the index and can be searched with `lime search --fuzzy`.
+    ///
+    /// Examples:
+    ///   "lime annotate add fn-abc123 -m 'Entry point for auth'"
+    ///   "lime annotate show fn-abc123"
+    ///   "lime annotate list"
+    ///   "lime annotate list rust fn"
+    ///   "lime annotate remove fn-abc123"
+    Annotate {
+        #[command(subcommand)]
+        action: AnnotateAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AnnotateAction {
+    /// Add or update an annotation on a component.
+    ///
+    /// If the component already has an annotation, it is updated
+    /// (preserving the original created_at timestamp).
+    ///
+    /// Examples:
+    ///   "lime annotate add fn-abc123 -m 'Entry point for auth flow'"
+    ///   "lime annotate add struct-def456 -m 'Primary data model for users'"
+    Add {
+        /// Component ID (from `lime search` or `lime list --all`).
+        component_id: String,
+        /// Annotation content (markdown).
+        #[arg(short = 'm', long = "message")]
+        message: String,
+    },
+    /// Display an annotation for a component.
+    ///
+    /// Shows the full annotation content with component metadata.
+    ///
+    /// Examples:
+    ///   "lime annotate show fn-abc123"
+    Show {
+        /// Component ID.
+        component_id: String,
+    },
+    /// List annotated components.
+    ///
+    /// Without arguments, lists all annotations. Optionally filter
+    /// by language and component type.
+    ///
+    /// Examples:
+    ///   "lime annotate list"              list all annotations
+    ///   "lime annotate list rust"         filter by language
+    ///   "lime annotate list rust fn"      filter by language and type
+    List {
+        /// Filter by language (e.g. `rust`, `python`).
+        language: Option<String>,
+        /// Filter by component type (e.g. `fn`, `struct`).
+        component_type: Option<String>,
+    },
+    /// Remove an annotation from a component.
+    ///
+    /// The component itself is not affected, only its annotation is deleted.
+    ///
+    /// Examples:
+    ///   "lime annotate remove fn-abc123"
+    Remove {
+        /// Component ID.
+        component_id: String,
     },
 }
 
@@ -301,7 +376,7 @@ fn handle_remove(root: PathBuf, filename: String) -> Result<Value> {
     }))
 }
 
-fn handle_search(root: PathBuf, terms: Vec<String>) -> Result<Value> {
+fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value> {
     if terms.is_empty() {
         bail!("search requires at least one argument");
     }
@@ -409,15 +484,146 @@ fn handle_search(root: PathBuf, terms: Vec<String>) -> Result<Value> {
             ))
     });
 
+    if !fuzzy {
+        let elapsed = timer.elapsed();
+        return Ok(json!({
+            "ok": true,
+            "command": "search",
+            "elapsed_secs": elapsed.as_secs_f64(),
+            "query": query,
+            "fuzzy": false,
+            "result_count": results.len(),
+            "results": results
+        }));
+    }
+
+    let exact_ids: HashSet<String> = results.iter().map(|c| c.id.clone()).collect();
+
+    let all_annotations = annotations::list_annotations(&root).unwrap_or_default();
+    let token_index = search::build_token_index(&index, &all_annotations);
+    let fuzzy_hits = search::fuzzy_search(&token_index, &query.query);
+
+    let annotation_map: std::collections::HashMap<String, &annotations::Annotation> =
+        all_annotations
+            .iter()
+            .map(|a| (a.hash_id.clone(), a))
+            .collect();
+
+    let component_map: std::collections::HashMap<&str, &ComponentRecord> = index
+        .components
+        .iter()
+        .map(|c| (c.id.as_str(), c))
+        .collect();
+
+    #[derive(Serialize)]
+    struct FuzzyResult<'a> {
+        #[serde(flatten)]
+        component: &'a ComponentRecord,
+        match_type: &'static str,
+        annotation_preview: Option<String>,
+        #[serde(skip)]
+        sort_score: f64,
+        #[serde(skip)]
+        sort_match_rank: u8,
+    }
+
+    let mut merged: Vec<FuzzyResult> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    for component in &results {
+        if seen_ids.insert(component.id.clone()) {
+            let preview = annotation_map
+                .get(&component.id)
+                .map(|a| truncate_preview(&a.content, 80));
+            merged.push(FuzzyResult {
+                component,
+                match_type: MatchType::Exact.as_str(),
+                annotation_preview: preview,
+                sort_score: 2.0,
+                sort_match_rank: 0,
+            });
+        }
+    }
+
+    for hit in &fuzzy_hits {
+        if exact_ids.contains(&hit.component_id) {
+            continue;
+        }
+        if !seen_ids.insert(hit.component_id.clone()) {
+            continue;
+        }
+        let Some(component) = component_map.get(hit.component_id.as_str()) else {
+            continue;
+        };
+        if !matches_search_filters(component, &query) {
+            continue;
+        }
+        let preview = annotation_map
+            .get(&hit.component_id)
+            .map(|a| truncate_preview(&a.content, 80));
+        merged.push(FuzzyResult {
+            component,
+            match_type: hit.match_type.as_str(),
+            annotation_preview: preview,
+            sort_score: hit.score,
+            sort_match_rank: hit.match_type.rank(),
+        });
+    }
+
+    merged.sort_by(|a, b| {
+        a.sort_match_rank
+            .cmp(&b.sort_match_rank)
+            .then(
+                b.sort_score
+                    .partial_cmp(&a.sort_score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(
+                (
+                    a.component.language.as_str(),
+                    a.component.file.as_str(),
+                    a.component.start_line,
+                    a.component.component_type.as_str(),
+                    a.component.name.as_str(),
+                )
+                    .cmp(&(
+                        b.component.language.as_str(),
+                        b.component.file.as_str(),
+                        b.component.start_line,
+                        b.component.component_type.as_str(),
+                        b.component.name.as_str(),
+                    )),
+            )
+    });
+
     let elapsed = timer.elapsed();
+
+    let results_json: Vec<Value> = merged
+        .iter()
+        .map(|r| {
+            let mut v = serde_json::to_value(r.component).unwrap_or(json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("match_type".to_string(), json!(r.match_type));
+                obj.insert(
+                    "annotation_preview".to_string(),
+                    match &r.annotation_preview {
+                        Some(p) => json!(p),
+                        None => Value::Null,
+                    },
+                );
+            }
+            v
+        })
+        .collect();
 
     Ok(json!({
         "ok": true,
         "command": "search",
         "elapsed_secs": elapsed.as_secs_f64(),
         "query": query,
-        "result_count": results.len(),
-        "results": results
+        "fuzzy": true,
+        "result_count": results_json.len(),
+        "results": results_json
     }))
 }
 
@@ -563,6 +769,149 @@ fn handle_deps(root: PathBuf, component_id: String, depth: Option<usize>) -> Res
     }))
 }
 
+fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
+    let config = LimeConfig::load_or_create(&root)?;
+    let timer = std::time::Instant::now();
+    let index = storage::load_index_or_empty(&root, &config)?;
+
+    match action {
+        AnnotateAction::Add {
+            component_id,
+            message,
+        } => {
+            let component = index
+                .components
+                .iter()
+                .find(|c| c.id == component_id)
+                .ok_or_else(|| anyhow!("component not found: {component_id}"))?;
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let existing = annotations::load_annotation(&root, &component_id)?;
+            let created_at = existing
+                .as_ref()
+                .map(|a| a.created_at.clone())
+                .unwrap_or_else(|| now.clone());
+
+            let (comp_type, _) = component_id
+                .split_once('-')
+                .unwrap_or(("component", &component_id));
+
+            let annotation = annotations::Annotation {
+                hash_id: component_id.clone(),
+                component_type: comp_type.to_string(),
+                component_name: component.name.clone(),
+                content: message.clone(),
+                created_at,
+                updated_at: now,
+            };
+
+            annotations::save_annotation(&root, &annotation)?;
+            let elapsed = timer.elapsed();
+
+            Ok(json!({
+                "ok": true,
+                "command": "annotate",
+                "action": "add",
+                "elapsed_secs": elapsed.as_secs_f64(),
+                "component": component,
+                "annotation": {
+                    "hash_id": annotation.hash_id,
+                    "content": annotation.content,
+                    "created_at": annotation.created_at,
+                    "updated_at": annotation.updated_at
+                }
+            }))
+        }
+        AnnotateAction::Show { component_id } => {
+            let component = index
+                .components
+                .iter()
+                .find(|c| c.id == component_id)
+                .ok_or_else(|| anyhow!("component not found: {component_id}"))?;
+
+            let annotation = annotations::load_annotation(&root, &component_id)?
+                .ok_or_else(|| anyhow!("no annotation for component: {component_id}"))?;
+            let elapsed = timer.elapsed();
+
+            Ok(json!({
+                "ok": true,
+                "command": "annotate",
+                "action": "show",
+                "elapsed_secs": elapsed.as_secs_f64(),
+                "component": component,
+                "annotation": {
+                    "hash_id": annotation.hash_id,
+                    "content": annotation.content,
+                    "created_at": annotation.created_at,
+                    "updated_at": annotation.updated_at
+                }
+            }))
+        }
+        AnnotateAction::List {
+            language,
+            component_type,
+        } => {
+            let all_annotations = annotations::list_annotations(&root)?;
+            let component_map: std::collections::HashMap<&str, &ComponentRecord> = index
+                .components
+                .iter()
+                .map(|c| (c.id.as_str(), c))
+                .collect();
+
+            let filtered: Vec<Value> = all_annotations
+                .iter()
+                .filter_map(|ann| {
+                    let comp = component_map.get(ann.hash_id.as_str())?;
+                    if let Some(lang) = &language {
+                        if comp.language != *lang {
+                            return None;
+                        }
+                    }
+                    if let Some(ctype) = &component_type {
+                        if comp.component_type.to_ascii_lowercase() != *ctype {
+                            return None;
+                        }
+                    }
+                    Some(json!({
+                        "component": comp,
+                        "annotation": {
+                            "hash_id": ann.hash_id,
+                            "content": ann.content,
+                            "preview": truncate_preview(&ann.content, 80),
+                            "created_at": ann.created_at,
+                            "updated_at": ann.updated_at
+                        }
+                    }))
+                })
+                .collect();
+
+            let elapsed = timer.elapsed();
+
+            Ok(json!({
+                "ok": true,
+                "command": "annotate",
+                "action": "list",
+                "elapsed_secs": elapsed.as_secs_f64(),
+                "count": filtered.len(),
+                "results": filtered
+            }))
+        }
+        AnnotateAction::Remove { component_id } => {
+            let removed = annotations::remove_annotation(&root, &component_id)?;
+            let elapsed = timer.elapsed();
+
+            Ok(json!({
+                "ok": true,
+                "command": "annotate",
+                "action": "remove",
+                "elapsed_secs": elapsed.as_secs_f64(),
+                "component_id": component_id,
+                "removed": removed
+            }))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct SearchQuery {
     language: Option<String>,
@@ -661,12 +1010,28 @@ fn summarize_index(index: &IndexData) -> Value {
             .or_insert(0) += 1;
     }
 
+    let batman_count = index
+        .components
+        .iter()
+        .filter(|component| component.batman)
+        .count();
+
     json!({
         "version": index.version,
         "generated_at": index.generated_at,
         "languages": index.languages,
         "file_count": index.files.len(),
         "component_count": index.components.len(),
+        "batman_count": batman_count,
         "component_breakdown": breakdown
     })
+}
+
+fn truncate_preview(content: &str, max_len: usize) -> String {
+    let single_line = content.lines().next().unwrap_or("").trim();
+    if single_line.len() <= max_len {
+        single_line.to_string()
+    } else {
+        format!("{}...", &single_line[..max_len.saturating_sub(3)])
+    }
 }

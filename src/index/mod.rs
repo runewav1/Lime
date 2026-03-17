@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::{
+    batman,
     config::LimeConfig,
     deps,
     parse::{detect_language, parse_components},
@@ -73,6 +74,9 @@ pub struct ComponentRecord {
     pub uses_before: Vec<String>,
     /// IDs of components that reference this component.
     pub used_by_after: Vec<String>,
+    /// Whether this component is flagged as dead code (disconnected from the main graph).
+    #[serde(default)]
+    pub batman: bool,
 }
 
 /// Result metadata for partial file updates.
@@ -178,6 +182,7 @@ pub fn rebuild_index(root: &Path, config: &LimeConfig) -> Result<IndexData> {
     }
 
     deps::populate_dependencies(&mut index, &file_contents);
+    batman::detect_batman(&mut index, &file_contents);
     index.refresh_metadata();
     Ok(index)
 }
@@ -381,6 +386,7 @@ fn build_indexed_file(
             end_line: component.end_line,
             uses_before: Vec::new(),
             used_by_after: Vec::new(),
+            batman: false,
         });
     }
 
@@ -421,6 +427,7 @@ fn refresh_dependencies_from_disk(root: &Path, index: &mut IndexData) -> Result<
     }
 
     deps::populate_dependencies(index, &file_contents);
+    batman::detect_batman(index, &file_contents);
     index.refresh_metadata();
     Ok(())
 }

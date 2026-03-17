@@ -74,6 +74,7 @@ pub fn render(payload: &Value) -> String {
         "search" => render_search(payload, &s),
         "list" => render_list(payload, &s),
         "deps" => render_deps(payload, &s),
+        "annotate" => render_annotate(payload, &s),
         _ => serde_json::to_string_pretty(payload).unwrap_or_default(),
     }
 }
@@ -94,6 +95,7 @@ fn render_sync(v: &Value, s: &Style) -> String {
         if let Some(idx) = v.get("index") {
             let files = num_val(idx, "file_count");
             let components = num_val(idx, "component_count");
+            let batman_count = num_val(idx, "batman_count");
             let languages = str_array(idx, "languages");
             let _ = write!(
                 out,
@@ -108,6 +110,9 @@ fn render_sync(v: &Value, s: &Style) -> String {
                 let colored: Vec<String> = languages.iter().map(|l| s.cyan(l)).collect();
                 let _ = write!(out, " ({})", colored.join(", "));
             }
+            if batman_count > 0 {
+                let _ = write!(out, " {}", s.yellow(&format!("[{batman_count} batman]")));
+            }
             if let Some(elapsed) = v.get("elapsed_secs").and_then(Value::as_f64) {
                 let _ = write!(out, " in {}", s.dim(&format_duration(elapsed)));
             }
@@ -121,7 +126,7 @@ fn render_sync(v: &Value, s: &Style) -> String {
         if let Some(result) = v.get("result") {
             write_file_result(&mut out, result, s);
         }
-        write_index_summary(&mut out, v, s);
+        write_index_summary(&mut out, v, s, true);
         if verbose {
             if let Some(idx) = v.get("index") {
                 write_component_breakdown(&mut out, idx, s);
@@ -133,6 +138,16 @@ fn render_sync(v: &Value, s: &Style) -> String {
 }
 
 fn write_component_breakdown(out: &mut String, idx: &Value, s: &Style) {
+    let batman_count = num_val(idx, "batman_count");
+    if batman_count > 0 {
+        let _ = writeln!(
+            out,
+            "  {} {}",
+            s.yellow("[batman]"),
+            s.dim(&format!("{batman_count} flagged"))
+        );
+    }
+
     let Some(breakdown) = idx.get("component_breakdown").and_then(Value::as_object) else {
         return;
     };
@@ -165,7 +180,7 @@ fn render_add(v: &Value, s: &Style) -> String {
         let _ = writeln!(out, "  {} {filename}", s.green("+"));
     }
 
-    write_index_summary(&mut out, v, s);
+    write_index_summary(&mut out, v, s, false);
     out
 }
 
@@ -186,7 +201,7 @@ fn render_remove(v: &Value, s: &Style) -> String {
         let _ = writeln!(out, "  {} {filename}", s.yellow("not indexed:"));
     }
 
-    write_index_summary(&mut out, v, s);
+    write_index_summary(&mut out, v, s, false);
     out
 }
 
@@ -195,9 +210,13 @@ fn render_remove(v: &Value, s: &Style) -> String {
 fn render_search(v: &Value, s: &Style) -> String {
     let mut out = String::new();
     let count = num_val(v, "result_count");
+    let fuzzy_mode = v.get("fuzzy").and_then(Value::as_bool).unwrap_or(false);
 
     if count == 0 {
         let _ = writeln!(out, "No results");
+        if fuzzy_mode {
+            let _ = writeln!(out, "{}", s.dim("(try without --fuzzy for exact matching)"));
+        }
         return out;
     }
 
@@ -206,6 +225,9 @@ fn render_search(v: &Value, s: &Style) -> String {
         let mut styled_labels = Vec::with_capacity(results.len());
         let mut locations = Vec::with_capacity(results.len());
         let mut ids = Vec::with_capacity(results.len());
+        let mut batman_flags = Vec::with_capacity(results.len());
+        let mut match_types: Vec<String> = Vec::with_capacity(results.len());
+        let mut annotation_previews: Vec<Option<String>> = Vec::with_capacity(results.len());
 
         for c in results {
             let name = display_name(&str_val(c, "name"));
@@ -217,6 +239,13 @@ fn render_search(v: &Value, s: &Style) -> String {
             styled_labels.push(format!("{} ({})", s.bold(&name), s.cyan(&ctype)));
             locations.push(format!("{file}:{start}"));
             ids.push(str_val(c, "id"));
+            batman_flags.push(bool_val(c, "batman"));
+            match_types.push(str_val(c, "match_type"));
+            annotation_previews.push(
+                c.get("annotation_preview")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+            );
         }
 
         let max_label = plain_labels.iter().map(|l| l.len()).max().unwrap_or(0);
@@ -225,7 +254,22 @@ fn render_search(v: &Value, s: &Style) -> String {
         for i in 0..results.len() {
             let padded_label = pad_styled(&styled_labels[i], plain_labels[i].len(), max_label);
             let padded_loc = pad_styled(&locations[i], locations[i].len(), max_loc);
-            let _ = writeln!(out, "  {padded_label}  {padded_loc}  {}", s.dim(&ids[i]));
+            let _ = write!(out, "  {padded_label}  {padded_loc}  {}", s.dim(&ids[i]));
+
+            if batman_flags[i] {
+                let _ = write!(out, " {}", s.dim("[batman]"));
+            }
+
+            if fuzzy_mode && !match_types[i].is_empty() && match_types[i] != "exact" {
+                let _ = write!(out, " {}", s.dim(&format!("({})", match_types[i])));
+            }
+            let _ = writeln!(out);
+
+            if let Some(preview) = &annotation_previews[i] {
+                if !preview.is_empty() {
+                    let _ = writeln!(out, "    {}", s.dim(preview));
+                }
+            }
         }
     }
 
@@ -387,8 +431,19 @@ fn render_list_components(v: &Value, label: &str, s: &Style) -> String {
 
             let start = num_val(component, "start_line");
             let id = str_val(component, "id");
+            let batman = bool_val(component, "batman");
             let padded = pad_styled(&styled_labels[i], plain_labels[i].len(), max_label);
-            let _ = writeln!(out, "    {padded}  :{start}  {}", s.dim(&id));
+            let batman_marker = if batman {
+                format!(" {}", s.dim("[batman]"))
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                out,
+                "    {padded}  :{start}  {}{}",
+                s.dim(&id),
+                batman_marker
+            );
         }
     }
 
@@ -417,13 +472,20 @@ fn render_deps(v: &Value, s: &Style) -> String {
         let file = str_val(component, "file");
         let start = num_val(component, "start_line");
         let id = str_val(component, "id");
+        let batman = bool_val(component, "batman");
+        let batman_marker = if batman {
+            format!(" {}", s.yellow("[batman]"))
+        } else {
+            String::new()
+        };
 
         let _ = writeln!(
             out,
-            "{} ({})  {file}:{start}  {}",
+            "{} ({})  {file}:{start}  {}{}",
             s.bold(&name),
             s.cyan(&ctype),
-            s.dim(&id)
+            s.dim(&id),
+            batman_marker
         );
     }
 
@@ -471,6 +533,7 @@ fn write_dep_nodes(out: &mut String, nodes: &[Value], s: &Style) {
     let mut styled_labels = Vec::with_capacity(nodes.len());
     let mut locations = Vec::with_capacity(nodes.len());
     let mut ids = Vec::with_capacity(nodes.len());
+    let mut batman_flags = Vec::with_capacity(nodes.len());
 
     for n in nodes {
         let ctype = str_val(n, "type");
@@ -482,6 +545,7 @@ fn write_dep_nodes(out: &mut String, nodes: &[Value], s: &Style) {
         styled_labels.push(format!("{name} ({})", s.cyan(&ctype)));
         locations.push(format!("{file}:{start}"));
         ids.push(str_val(n, "id"));
+        batman_flags.push(bool_val(n, "batman"));
     }
 
     let max_label = plain_labels.iter().map(|l| l.len()).max().unwrap_or(0);
@@ -492,23 +556,205 @@ fn write_dep_nodes(out: &mut String, nodes: &[Value], s: &Style) {
         let depth = num_val(node, "depth");
         let padded_label = pad_styled(&styled_labels[i], plain_labels[i].len(), max_label);
         let padded_loc = pad_styled(&locations[i], locations[i].len(), max_loc);
+        let batman_marker = if batman_flags[i] {
+            format!(" {}", s.yellow("[batman]"))
+        } else {
+            String::new()
+        };
 
         if max_id > 0 {
             let dim_id = s.dim(&ids[i]);
             let padded_id = pad_styled(&dim_id, ids[i].len(), max_id);
             let _ = writeln!(
                 out,
-                "    {padded_label}  {padded_loc}  {padded_id}  {}",
-                s.dim(&format!("depth:{depth}"))
+                "    {padded_label}  {padded_loc}  {padded_id}  {}{}",
+                s.dim(&format!("depth:{depth}")),
+                batman_marker
             );
         } else {
             let _ = writeln!(
                 out,
-                "    {padded_label}  {padded_loc}  {}",
-                s.dim(&format!("depth:{depth}"))
+                "    {padded_label}  {padded_loc}  {}{}",
+                s.dim(&format!("depth:{depth}")),
+                batman_marker
             );
         }
     }
+}
+
+// ── annotate ────────────────────────────────────────────────────
+
+fn render_annotate(v: &Value, s: &Style) -> String {
+    match str_val(v, "action").as_str() {
+        "add" => render_annotate_add(v, s),
+        "show" => render_annotate_show(v, s),
+        "list" => render_annotate_list(v, s),
+        "remove" => render_annotate_remove(v, s),
+        _ => serde_json::to_string_pretty(v).unwrap_or_default(),
+    }
+}
+
+fn render_annotate_add(v: &Value, s: &Style) -> String {
+    let mut out = String::new();
+
+    if let Some(component) = v.get("component") {
+        let name = display_name(&str_val(component, "name"));
+        let ctype = str_val(component, "type");
+        let id = str_val(component, "id");
+        let _ = writeln!(
+            out,
+            "  {} {} ({})  {}",
+            s.green("+"),
+            s.bold(&name),
+            s.cyan(&ctype),
+            s.dim(&id)
+        );
+    }
+
+    if let Some(ann) = v.get("annotation") {
+        let content = str_val(ann, "content");
+        let preview = if content.len() > 80 {
+            format!("{}...", &content[..77])
+        } else {
+            content
+        };
+        let _ = writeln!(out, "    {}", s.dim(&preview));
+    }
+
+    if let Some(elapsed) = v.get("elapsed_secs").and_then(Value::as_f64) {
+        let _ = writeln!(
+            out,
+            "\n{}",
+            s.dim(&format!("Saved in {}", format_duration(elapsed)))
+        );
+    }
+
+    out
+}
+
+fn render_annotate_show(v: &Value, s: &Style) -> String {
+    let mut out = String::new();
+
+    if let Some(component) = v.get("component") {
+        let name = display_name(&str_val(component, "name"));
+        let ctype = str_val(component, "type");
+        let file = str_val(component, "file");
+        let start = num_val(component, "start_line");
+        let id = str_val(component, "id");
+        let _ = writeln!(
+            out,
+            "{} ({})  {file}:{start}  {}",
+            s.bold(&name),
+            s.cyan(&ctype),
+            s.dim(&id)
+        );
+    }
+
+    if let Some(ann) = v.get("annotation") {
+        let created = str_val(ann, "created_at");
+        let updated = str_val(ann, "updated_at");
+        let _ = writeln!(
+            out,
+            "  {} {}  {} {}",
+            s.dim("created:"),
+            s.dim(&created),
+            s.dim("updated:"),
+            s.dim(&updated)
+        );
+        let _ = writeln!(out);
+        let content = str_val(ann, "content");
+        for line in content.lines() {
+            let _ = writeln!(out, "  {line}");
+        }
+        if content.is_empty() {
+            let _ = writeln!(out, "  {}", s.dim("(empty)"));
+        }
+    }
+
+    if let Some(elapsed) = v.get("elapsed_secs").and_then(Value::as_f64) {
+        let _ = writeln!(
+            out,
+            "\n{}",
+            s.dim(&format!("Loaded in {}", format_duration(elapsed)))
+        );
+    }
+
+    out
+}
+
+fn render_annotate_list(v: &Value, s: &Style) -> String {
+    let mut out = String::new();
+    let count = num_val(v, "count");
+
+    if count == 0 {
+        let _ = writeln!(out, "No annotations");
+        return out;
+    }
+
+    if let Some(results) = v.get("results").and_then(Value::as_array) {
+        let mut plain_labels = Vec::with_capacity(results.len());
+        let mut styled_labels = Vec::with_capacity(results.len());
+        let mut locations = Vec::with_capacity(results.len());
+        let mut previews = Vec::with_capacity(results.len());
+
+        for entry in results {
+            let comp = entry.get("component").unwrap_or(entry);
+            let ann = entry.get("annotation").unwrap_or(entry);
+
+            let name = display_name(&str_val(comp, "name"));
+            let ctype = str_val(comp, "type");
+            let file = str_val(comp, "file");
+            let start = num_val(comp, "start_line");
+
+            plain_labels.push(format!("{name} ({ctype})"));
+            styled_labels.push(format!("{} ({})", s.bold(&name), s.cyan(&ctype)));
+            locations.push(format!("{file}:{start}"));
+            previews.push(str_val(ann, "preview"));
+        }
+
+        let max_label = plain_labels.iter().map(|l| l.len()).max().unwrap_or(0);
+        let max_loc = locations.iter().map(|l| l.len()).max().unwrap_or(0);
+
+        for i in 0..results.len() {
+            let padded_label = pad_styled(&styled_labels[i], plain_labels[i].len(), max_label);
+            let padded_loc = pad_styled(&locations[i], locations[i].len(), max_loc);
+            let _ = writeln!(out, "  {padded_label}  {padded_loc}");
+            if !previews[i].is_empty() {
+                let _ = writeln!(out, "    {}", s.dim(&previews[i]));
+            }
+        }
+    }
+
+    let timing = v
+        .get("elapsed_secs")
+        .and_then(Value::as_f64)
+        .map(|e| format!(" in {}", s.dim(&format_duration(e))))
+        .unwrap_or_default();
+    let _ = writeln!(
+        out,
+        "\n{}{}",
+        s.bold(&format!("{count} annotation{}", plural(count))),
+        timing
+    );
+    out
+}
+
+fn render_annotate_remove(v: &Value, s: &Style) -> String {
+    let mut out = String::new();
+    let component_id = str_val(v, "component_id");
+    let removed = v.get("removed").and_then(Value::as_bool).unwrap_or(false);
+
+    if removed {
+        let _ = writeln!(out, "  {} {component_id}", s.red("-"));
+    } else {
+        let _ = writeln!(out, "  {} {component_id}", s.yellow("not found:"));
+    }
+
+    if let Some(elapsed) = v.get("elapsed_secs").and_then(Value::as_f64) {
+        let _ = writeln!(out, "\n{}", s.dim(&format_duration(elapsed)));
+    }
+
+    out
 }
 
 // ── shared formatting helpers ───────────────────────────────────
@@ -533,10 +779,16 @@ fn write_file_result(out: &mut String, result: &Value, s: &Style) {
     }
 }
 
-fn write_index_summary(out: &mut String, v: &Value, s: &Style) {
+fn write_index_summary(out: &mut String, v: &Value, s: &Style, include_batman: bool) {
     if let Some(idx) = v.get("index") {
         let files = num_val(idx, "file_count");
         let components = num_val(idx, "component_count");
+        let batman_count = num_val(idx, "batman_count");
+        let batman_suffix = if include_batman && batman_count > 0 {
+            format!(" {}", s.yellow(&format!("[{batman_count} batman]")))
+        } else {
+            String::new()
+        };
         let timing = v
             .get("elapsed_secs")
             .and_then(Value::as_f64)
@@ -544,10 +796,11 @@ fn write_index_summary(out: &mut String, v: &Value, s: &Style) {
             .unwrap_or_default();
         let _ = writeln!(
             out,
-            "{} {files} file{}, {components} component{}{}",
+            "{} {files} file{}, {components} component{}{}{}",
             s.bold("Index:"),
             plural(files),
             plural(components),
+            batman_suffix,
             timing
         );
     }
@@ -559,6 +812,10 @@ fn str_val(v: &Value, key: &str) -> String {
 
 fn num_val(v: &Value, key: &str) -> u64 {
     v.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn bool_val(v: &Value, key: &str) -> bool {
+    v.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
 fn str_array(v: &Value, key: &str) -> Vec<String> {
