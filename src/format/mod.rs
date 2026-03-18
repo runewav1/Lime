@@ -501,7 +501,7 @@ fn render_show(v: &Value, s: &Style) -> String {
         let end = num_val(component, "end_line");
         let id = str_val(component, "id");
         let death = str_val(component, "death_status");
-        let dead = !death.is_empty() && death != "Alive";
+        let dead = !death.is_empty() && death != "alive";
         let dead_marker = if dead {
             format!(" {}", s.bold_red("[dead]"))
         } else {

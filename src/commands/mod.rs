@@ -48,7 +48,6 @@ pub fn run() -> Result<()> {
     };
 
     let json_mode = cli.json;
-    let verbose = cli.verbose;
 
     let root = match env::current_dir() {
         Ok(dir) => dir,
@@ -56,7 +55,12 @@ pub fn run() -> Result<()> {
     };
 
     let result = match cli.command {
-        Commands::Sync { files, no_embeddings, diagnostics } => handle_sync(root, files, no_embeddings, diagnostics),
+        Commands::Sync {
+            files,
+            no_embeddings,
+            diagnostics,
+            verbose,
+        } => handle_sync(root, files, no_embeddings, diagnostics, verbose),
         Commands::Add { filename } => handle_add(root, filename),
         Commands::Remove { filename } => handle_remove(root, filename),
         Commands::Search {
@@ -79,18 +83,13 @@ pub fn run() -> Result<()> {
     };
 
     match result {
-        Ok(mut payload) => {
+        Ok(payload) => {
             if json_mode {
                 println!(
                     "{}",
                     serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string())
                 );
             } else {
-                if verbose {
-                    if let Some(obj) = payload.as_object_mut() {
-                        obj.insert("verbose".into(), json!(true));
-                    }
-                }
                 print!("{}", crate::format::render(&payload));
             }
         }
@@ -133,9 +132,6 @@ struct Cli {
     #[arg(long, global = true, help = "Output raw JSON for scripts and agents")]
     json: bool,
 
-    #[arg(short = 'v', long, global = true, help = "Show detailed output")]
-    verbose: bool,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -160,6 +156,9 @@ enum Commands {
         /// Run static analyzers and attach fault data to components.
         #[arg(long)]
         diagnostics: bool,
+        /// Show detailed output (component breakdown).
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
     /// Add a single file to the index.
     ///
@@ -434,7 +433,13 @@ enum ConfigAction {
     },
 }
 
-fn handle_sync(root: PathBuf, files: Vec<String>, no_embeddings: bool, run_diagnostics: bool) -> Result<Value> {
+fn handle_sync(
+    root: PathBuf,
+    files: Vec<String>,
+    no_embeddings: bool,
+    run_diagnostics: bool,
+    verbose: bool,
+) -> Result<Value> {
     let config = LimeConfig::load_or_create(&root)?;
     let do_diag = run_diagnostics || config.diagnostics.enabled;
 
@@ -457,6 +462,11 @@ fn handle_sync(root: PathBuf, files: Vec<String>, no_embeddings: bool, run_diagn
             "elapsed_secs": elapsed.as_secs_f64(),
             "index": summarize_index(&index)
         });
+        if verbose {
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("verbose".into(), json!(true));
+            }
+        }
         response["embeddings"] = embed_result;
         response["diagnostics"] = diag_result;
         return Ok(response);
@@ -485,6 +495,11 @@ fn handle_sync(root: PathBuf, files: Vec<String>, no_embeddings: bool, run_diagn
         "result": result,
         "index": summarize_index(&updated)
     });
+    if verbose {
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert("verbose".into(), json!(true));
+        }
+    }
     response["embeddings"] = embed_result;
     response["diagnostics"] = diag_result;
     Ok(response)
