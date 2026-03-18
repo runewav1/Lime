@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -14,6 +14,7 @@ use crate::{
     chunk,
     config::LimeConfig,
     deps,
+    diagnostics,
     embeddings,
     index::{self, ComponentRecord, DeathStatus, IndexData},
     search::{self, MatchType},
@@ -55,7 +56,7 @@ pub fn run() -> Result<()> {
     };
 
     let result = match cli.command {
-        Commands::Sync { files, no_embeddings } => handle_sync(root, files, no_embeddings),
+        Commands::Sync { files, no_embeddings, diagnostics } => handle_sync(root, files, no_embeddings, diagnostics),
         Commands::Add { filename } => handle_add(root, filename),
         Commands::Remove { filename } => handle_remove(root, filename),
         Commands::Search {
@@ -68,6 +69,7 @@ pub fn run() -> Result<()> {
             component_type,
             all,
         } => handle_list(root, language, component_type, all),
+        Commands::Show { component_id } => handle_show(root, component_id),
         Commands::Deps {
             component_id,
             depth,
@@ -155,6 +157,9 @@ enum Commands {
         /// Skip embedding generation for this sync, even if enabled in config.
         #[arg(long = "no-embeddings")]
         no_embeddings: bool,
+        /// Run static analyzers and attach fault data to components.
+        #[arg(long)]
+        diagnostics: bool,
     },
     /// Add a single file to the index.
     ///
@@ -255,6 +260,19 @@ enum Commands {
         #[command(subcommand)]
         action: AnnotateAction,
     },
+    /// Show a component's source code with line numbers and inline diagnostics.
+    ///
+    /// Reads the source file from disk and prints the component's line range
+    /// with syntax highlighting, diagnostic markers, and the annotation
+    /// (if any). Use component IDs from `lime list --all` or `lime search`.
+    ///
+    /// Examples:
+    ///   "lime show fn-abc123def456"
+    Show {
+        /// Component ID (from `lime search` or `lime list --all`).
+        component_id: String,
+    },
+
     /// Inspect and update Lime configuration.
     ///
     /// This reads and writes `.lime/lime.json` in the current repository.
@@ -377,6 +395,23 @@ enum ConfigAction {
     /// Examples:
     ///   "lime config death-seeds --seed-file src/main.rs --seed-name main --seed-type fn"
     ///   "lime config death-seeds --clear-seed-files --seed-file cmd/**"
+    /// Update diagnostics configuration.
+    ///
+    /// Controls whether static analysis runs during `lime list --diagnostics`
+    /// or `lime analyze`, and sets per-language tool preferences.
+    ///
+    /// Examples:
+    ///   "lime config diagnostics --enabled true"
+    ///   "lime config diagnostics --timeout 60"
+    Diagnostics {
+        /// Enable or disable diagnostics integration.
+        #[arg(long)]
+        enabled: Option<bool>,
+        /// Timeout in seconds for each analyzer invocation.
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+
     DeathSeeds {
         /// Add file path patterns whose components are always alive seeds.
         #[arg(long = "seed-file")]
@@ -399,12 +434,16 @@ enum ConfigAction {
     },
 }
 
-fn handle_sync(root: PathBuf, files: Vec<String>, no_embeddings: bool) -> Result<Value> {
+fn handle_sync(root: PathBuf, files: Vec<String>, no_embeddings: bool, run_diagnostics: bool) -> Result<Value> {
     let config = LimeConfig::load_or_create(&root)?;
+    let do_diag = run_diagnostics || config.diagnostics.enabled;
 
     if files.is_empty() {
         let timer = std::time::Instant::now();
-        let index = index::rebuild_index(&root, &config)?;
+        let mut index = index::rebuild_index(&root, &config)?;
+
+        let diag_result = run_and_attach_diagnostics(&root, &mut index, do_diag);
+
         let elapsed = timer.elapsed();
         storage::save_index(&root, &config, &index)?;
         persist_token_index(&root, &index);
@@ -419,12 +458,16 @@ fn handle_sync(root: PathBuf, files: Vec<String>, no_embeddings: bool) -> Result
             "index": summarize_index(&index)
         });
         response["embeddings"] = embed_result;
+        response["diagnostics"] = diag_result;
         return Ok(response);
     }
 
     let current = storage::load_index_or_empty(&root, &config)?;
     let timer = std::time::Instant::now();
-    let (updated, result) = index::sync_files(&root, &config, &files, current)?;
+    let (mut updated, result) = index::sync_files(&root, &config, &files, current)?;
+
+    let diag_result = run_and_attach_diagnostics(&root, &mut updated, do_diag);
+
     let elapsed = timer.elapsed();
     storage::save_index(&root, &config, &updated)?;
     persist_token_index(&root, &updated);
@@ -443,7 +486,50 @@ fn handle_sync(root: PathBuf, files: Vec<String>, no_embeddings: bool) -> Result
         "index": summarize_index(&updated)
     });
     response["embeddings"] = embed_result;
+    response["diagnostics"] = diag_result;
     Ok(response)
+}
+
+fn run_and_attach_diagnostics(root: &std::path::Path, index: &mut IndexData, enabled: bool) -> Value {
+    if !enabled {
+        let _ = storage::save_diagnostics_cache(root, &std::collections::HashMap::new());
+        return json!({ "enabled": false, "status": "skipped" });
+    }
+
+    let results = diagnostics::run_diagnostics(root, index);
+    let faults_map = diagnostics::map_diagnostics_to_components(root, &results, &index.components);
+    let entries_map = diagnostics::build_component_diagnostics_map(root, &results, &index.components);
+
+    for component in &mut index.components {
+        if let Some(faults) = faults_map.get(&component.id) {
+            component.faults = faults.clone();
+        }
+    }
+
+    let _ = storage::save_diagnostics_cache(root, &entries_map);
+
+    let total_errors: usize = results.iter().flat_map(|r| &r.entries)
+        .filter(|e| e.severity == diagnostics::DiagSeverity::Error).count();
+    let total_warnings: usize = results.iter().flat_map(|r| &r.entries)
+        .filter(|e| e.severity == diagnostics::DiagSeverity::Warning).count();
+    let faulty = faults_map.len();
+
+    let analyzer_info: Vec<Value> = results.iter().map(|r| json!({
+        "language": r.language,
+        "tool": r.tool,
+        "tool_found": r.tool_found,
+        "tool_failed": r.tool_failed,
+        "entry_count": r.entries.len(),
+    })).collect();
+
+    json!({
+        "enabled": true,
+        "status": "ok",
+        "total_errors": total_errors,
+        "total_warnings": total_warnings,
+        "faulty_components": faulty,
+        "analyzers": analyzer_info,
+    })
 }
 
 fn handle_add(root: PathBuf, filename: String) -> Result<Value> {
@@ -538,6 +624,22 @@ fn handle_config(root: PathBuf, action: ConfigAction) -> Result<Value> {
                 "ok": true,
                 "command": "config_embeddings",
                 "embeddings": embeddings,
+            }))
+        }
+        ConfigAction::Diagnostics { enabled, timeout } => {
+            let mut config = LimeConfig::load_or_create(&root)?;
+            if let Some(value) = enabled {
+                config.diagnostics.enabled = value;
+            }
+            if let Some(value) = timeout {
+                config.diagnostics.timeout_secs = value;
+            }
+            config.save(&root)?;
+            let diag = config.diagnostics.clone();
+            Ok(json!({
+                "ok": true,
+                "command": "config_diagnostics",
+                "diagnostics": diag,
             }))
         }
         ConfigAction::DeathSeeds {
@@ -963,8 +1065,17 @@ fn handle_list(
         }));
     }
 
+    let dead_count = components
+        .iter()
+        .filter(|c| c.death_status.is_dead())
+        .count();
+    let faulty_count = components
+        .iter()
+        .filter(|c| c.faults.total() > 0)
+        .count();
+
     let mut by_type = BTreeMap::<String, usize>::new();
-    for component in components {
+    for component in &components {
         *by_type.entry(component.component_type.clone()).or_insert(0) += 1;
     }
 
@@ -975,7 +1086,89 @@ fn handle_list(
         "mode": "language_summary",
         "elapsed_secs": elapsed.as_secs_f64(),
         "language": language,
+        "total": components.len(),
+        "dead": dead_count,
+        "faulty": faulty_count,
         "component_counts": by_type
+    }))
+}
+
+fn handle_show(root: PathBuf, component_id: String) -> Result<Value> {
+    let config = LimeConfig::load_or_create(&root)?;
+    let index = storage::load_index_or_empty(&root, &config)?;
+
+    let component = index
+        .components
+        .iter()
+        .find(|c| c.id == component_id)
+        .ok_or_else(|| anyhow!("component not found: {component_id}"))?
+        .clone();
+
+    let file_path = root.join(&component.file);
+    let source = std::fs::read_to_string(&file_path)
+        .with_context(|| format!("failed reading source file: {}", file_path.display()))?;
+
+    let file_hash_current = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(source.as_bytes());
+        hasher.finalize().to_hex().to_string()
+    };
+    let stored_hash = index.files.iter()
+        .find(|f| f.path == component.file)
+        .map(|f| f.file_hash.clone())
+        .unwrap_or_default();
+    let file_changed = !stored_hash.is_empty() && stored_hash != file_hash_current;
+
+    let lines: Vec<&str> = source.lines().collect();
+    let start = component.start_line.saturating_sub(1);
+    let end = component.end_line.min(lines.len());
+    let component_lines: Vec<&str> = lines[start..end].to_vec();
+
+    let diag_cache = storage::load_diagnostics_cache(&root).unwrap_or_default();
+    let diag_entries = diag_cache.get(&component_id).cloned().unwrap_or_default();
+
+    let annotation = annotations::load_annotation(&root, &component_id)?;
+
+    let mut source_line_data: Vec<Value> = Vec::new();
+    for (i, line_text) in component_lines.iter().enumerate() {
+        let line_num = component.start_line + i;
+        let line_diags: Vec<Value> = diag_entries.iter()
+            .filter(|e| e.line == line_num)
+            .map(|e| json!({
+                "severity": match e.severity {
+                    diagnostics::DiagSeverity::Error => "error",
+                    diagnostics::DiagSeverity::Warning => "warning",
+                    diagnostics::DiagSeverity::Note => "note",
+                },
+                "code": e.code,
+                "message": e.message,
+            }))
+            .collect();
+
+        source_line_data.push(json!({
+            "line": line_num,
+            "code": line_text,
+            "diagnostics": line_diags,
+        }));
+    }
+
+    Ok(json!({
+        "ok": true,
+        "command": "show",
+        "component": {
+            "id": component.id,
+            "language": component.language,
+            "type": component.component_type,
+            "name": component.name,
+            "file": component.file,
+            "start_line": component.start_line,
+            "end_line": component.end_line,
+            "death_status": component.death_status,
+            "faults": component.faults,
+        },
+        "file_changed": file_changed,
+        "source_lines": source_line_data,
+        "annotation": annotation,
     }))
 }
 

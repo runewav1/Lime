@@ -829,6 +829,7 @@ mod tests {
             batman: false,
             death_status: DeathStatus::Alive,
             death_evidence: DeathEvidence::default(),
+            faults: crate::diagnostics::ComponentFaults::default(),
         }
     }
 

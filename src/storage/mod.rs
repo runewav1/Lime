@@ -1,9 +1,14 @@
-use std::{fs, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    path::Path,
+};
 
 use anyhow::{Context, Result};
 
 use crate::{
     config::LimeConfig,
+    diagnostics::DiagnosticEntry,
     index::IndexData,
     search::{PersistedTokenIndex, SearchTokenIndex},
 };
@@ -69,4 +74,41 @@ pub fn load_token_index(root: &Path) -> Result<Option<SearchTokenIndex>> {
     let persisted: PersistedTokenIndex = serde_json::from_str(&content)
         .with_context(|| format!("failed parsing token index: {}", path.display()))?;
     Ok(Some(SearchTokenIndex::from(persisted)))
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics cache persistence
+// ---------------------------------------------------------------------------
+
+fn diagnostics_cache_path(root: &Path) -> std::path::PathBuf {
+    root.join(".lime").join("diagnostics.json")
+}
+
+pub fn save_diagnostics_cache(
+    root: &Path,
+    cache: &HashMap<String, Vec<DiagnosticEntry>>,
+) -> Result<()> {
+    let path = diagnostics_cache_path(root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating diagnostics cache dir: {}", parent.display()))?;
+    }
+    let payload = serde_json::to_string(cache).context("failed serializing diagnostics cache")?;
+    fs::write(&path, payload)
+        .with_context(|| format!("failed writing diagnostics cache: {}", path.display()))?;
+    Ok(())
+}
+
+pub fn load_diagnostics_cache(
+    root: &Path,
+) -> Result<HashMap<String, Vec<DiagnosticEntry>>> {
+    let path = diagnostics_cache_path(root);
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("failed reading diagnostics cache: {}", path.display()))?;
+    let parsed: HashMap<String, Vec<DiagnosticEntry>> = serde_json::from_str(&content)
+        .with_context(|| format!("failed parsing diagnostics cache: {}", path.display()))?;
+    Ok(parsed)
 }

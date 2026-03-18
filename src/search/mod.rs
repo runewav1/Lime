@@ -7,6 +7,57 @@ use serde::{Deserialize, Serialize};
 
 use crate::{annotations::Annotation, index::IndexData};
 
+/// Static alias map for high-value morphological roots that cannot be
+/// reliably derived via suffix stripping alone (e.g. `dead` ↔ `death`,
+/// `config` ↔ `configuration`).  Keys are canonical roots; values are
+/// related forms that should be treated as siblings during search.
+static ROOT_ALIASES: LazyLock<HashMap<&'static str, &'static [&'static str]>> = LazyLock::new(|| {
+    HashMap::from([
+        ("config", &["configuration", "configure", "configured", "configs"][..]),
+        ("dead", &["death", "deaths"]),
+        ("delete", &["deletion", "deleted", "deleting"]),
+        ("create", &["creation", "created", "creating"]),
+        ("execute", &["execution", "executed", "executing"]),
+        ("migrate", &["migration", "migrated", "migrating", "migrations"]),
+        ("validate", &["validation", "validated", "validating"]),
+        ("authenticate", &["authentication", "authenticated", "auth"]),
+        ("authorize", &["authorization", "authorized", "auth"]),
+        ("connect", &["connection", "connected", "connections"]),
+        ("depend", &["dependency", "dependencies", "dependent", "dependence"]),
+        ("register", &["registration", "registered"]),
+        ("generate", &["generation", "generated", "generator"]),
+        ("transform", &["transformation", "transformed"]),
+        ("compile", &["compilation", "compiled", "compiler"]),
+        ("serialize", &["serialization", "serialized", "serializer"]),
+        ("deserialize", &["deserialization", "deserialized"]),
+        ("optimize", &["optimization", "optimized", "optimizer"]),
+        ("initialize", &["initialization", "initialized", "init"]),
+        ("resolve", &["resolution", "resolved", "resolver"]),
+        ("define", &["definition", "defined", "definitions"]),
+        ("describe", &["description", "described"]),
+        ("inject", &["injection", "injected"]),
+        ("parse", &["parser", "parsing", "parsed"]),
+        ("render", &["renderer", "rendering", "rendered"]),
+        ("dispatch", &["dispatcher", "dispatched", "dispatching"]),
+        ("subscribe", &["subscription", "subscribed", "subscriber"]),
+        ("emit", &["emitter", "emitting", "emitted", "emission"]),
+        ("destruct", &["destruction", "destructor"]),
+        ("construct", &["construction", "constructor"]),
+        ("compose", &["composition", "composed", "composer"]),
+        ("assert", &["assertion", "assertions", "asserted"]),
+        ("allocate", &["allocation", "allocated", "allocator"]),
+        ("encrypt", &["encryption", "encrypted"]),
+        ("decrypt", &["decryption", "decrypted"]),
+        ("navigate", &["navigation", "navigated"]),
+        ("iterate", &["iteration", "iterator", "iterable"]),
+        ("mutate", &["mutation", "mutable", "mutated"]),
+        ("aggregate", &["aggregation", "aggregated", "aggregator"]),
+        ("annotate", &["annotation", "annotated", "annotations"]),
+        ("deprecate", &["deprecation", "deprecated"]),
+        ("synchronize", &["synchronization", "synchronized", "sync"]),
+    ])
+});
+
 static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     HashSet::from([
         "a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "do", "does",
@@ -134,15 +185,42 @@ impl SearchTokenIndex {
     }
 
     fn stem_siblings_for(&self, query_token: &str) -> Vec<String> {
+        let mut siblings = HashSet::new();
+
         let query_stem = stem(query_token);
-        match self.stem_index.get(&query_stem) {
-            Some(siblings) => siblings
-                .iter()
-                .filter(|t| t.as_str() != query_token)
-                .cloned()
-                .collect(),
-            None => Vec::new(),
+        if let Some(stem_sibs) = self.stem_index.get(&query_stem) {
+            for s in stem_sibs {
+                if s.as_str() != query_token {
+                    siblings.insert(s.clone());
+                }
+            }
         }
+
+        for (root, aliases) in ROOT_ALIASES.iter() {
+            let lower = query_token.to_ascii_lowercase();
+            let is_member = *root == lower || aliases.contains(&lower.as_str());
+            if !is_member {
+                continue;
+            }
+            if *root != lower {
+                if let Some(comps) = self.token_to_components.get(*root) {
+                    if !comps.is_empty() {
+                        siblings.insert(root.to_string());
+                    }
+                }
+            }
+            for alias in *aliases {
+                if *alias != lower {
+                    if let Some(comps) = self.token_to_components.get(*alias) {
+                        if !comps.is_empty() {
+                            siblings.insert(alias.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        siblings.into_iter().collect()
     }
 }
 
@@ -255,8 +333,12 @@ pub fn stem(word: &str) -> String {
         s.truncate(s.len() - 4);
     } else if s.ends_with("ible") && s.len() > 5 {
         s.truncate(s.len() - 4);
-    } else if s.ends_with("tion") || s.ends_with("sion") {
-        // keep: these are root forms
+    } else if s.ends_with("ation") && s.len() > 6 {
+        s.truncate(s.len() - 5);
+    } else if s.ends_with("tion") && s.len() > 5 {
+        s.truncate(s.len() - 4);
+    } else if s.ends_with("sion") && s.len() > 5 {
+        s.truncate(s.len() - 4);
     } else if s.ends_with("ence") || s.ends_with("ance") {
         // keep: these are root forms (dependence, performance)
     } else if s.ends_with("ings") && s.len() > 5 {
@@ -293,6 +375,10 @@ pub fn stem(word: &str) -> String {
         }
     } else if s.ends_with('s') && s.len() > 4 && !s.ends_with("ss") {
         s.pop();
+    }
+
+    if s.ends_with("th") && s.len() > 4 {
+        s.truncate(s.len() - 2);
     }
 
     if s.ends_with('e') && s.len() > 4 {
@@ -491,9 +577,23 @@ fn build_stem_index(token_to_components: &HashMap<String, Vec<String>>) -> HashM
             stem_map.entry(s).or_default().insert(token.clone());
         }
     }
+
+    for (root, aliases) in ROOT_ALIASES.iter() {
+        let shared_stem = stem(root);
+        let group = stem_map.entry(shared_stem).or_default();
+        if token_to_components.contains_key(*root) {
+            group.insert(root.to_string());
+        }
+        for alias in *aliases {
+            if token_to_components.contains_key(*alias) {
+                group.insert(alias.to_string());
+            }
+        }
+    }
+
     stem_map
         .into_iter()
-        .filter(|(_, tokens)| tokens.len() >= 1)
+        .filter(|(_, tokens)| !tokens.is_empty())
         .map(|(k, v)| (k, v.into_iter().collect()))
         .collect()
 }
@@ -841,9 +941,11 @@ fn name_match_with_fuzzy(index_token: &str, query_token: &str) -> Option<MatchCa
 }
 
 fn stem_similarity_score(query_token: &str, sibling_token: &str) -> f64 {
+    let is_alias_pair = is_alias_connected(query_token, sibling_token);
+
     let query_stem = stem(query_token);
     let sibling_stem = stem(sibling_token);
-    if query_stem != sibling_stem {
+    if query_stem != sibling_stem && !is_alias_pair {
         return 0.0;
     }
 
@@ -855,7 +957,21 @@ fn stem_similarity_score(query_token: &str, sibling_token: &str) -> f64 {
     let max_len = query_token.len().max(sibling_token.len());
     let prefix_ratio = shared_prefix as f64 / max_len as f64;
 
-    0.35 + (0.25 * prefix_ratio)
+    let base = if is_alias_pair { 0.45 } else { 0.35 };
+    base + (0.20 * prefix_ratio)
+}
+
+fn is_alias_connected(a: &str, b: &str) -> bool {
+    let la = a.to_ascii_lowercase();
+    let lb = b.to_ascii_lowercase();
+    for (root, aliases) in ROOT_ALIASES.iter() {
+        let a_in = *root == la || aliases.contains(&la.as_str());
+        let b_in = *root == lb || aliases.contains(&lb.as_str());
+        if a_in && b_in {
+            return true;
+        }
+    }
+    false
 }
 
 fn update_best_match(
@@ -1121,6 +1237,7 @@ mod tests {
             batman: false,
             death_status: DeathStatus::Alive,
             death_evidence: DeathEvidence::default(),
+            faults: crate::diagnostics::ComponentFaults::default(),
         }
     }
 
@@ -1158,6 +1275,78 @@ mod tests {
         let sibs = siblings.unwrap();
         assert!(sibs.contains(&"dependency".to_string()));
         assert!(sibs.contains(&"dependencies".to_string()));
+    }
+
+    #[test]
+    fn alias_dead_finds_death() {
+        let index = sample_index(vec![
+            component("fn-die", "death_handler"),
+            component("fn-alive", "keepAlive"),
+        ]);
+        let token_index = build_token_index(&index, &[]);
+        let hits = fuzzy_search(&token_index, "dead");
+        let ids: Vec<&str> = hits.iter().map(|h| h.component_id.as_str()).collect();
+        assert!(ids.contains(&"fn-die"), "searching 'dead' should find 'death_handler' via alias, got: {ids:?}");
+    }
+
+    #[test]
+    fn alias_config_finds_configuration() {
+        let index = sample_index(vec![
+            component("fn-cfg", "loadConfiguration"),
+            component("fn-set", "configureApp"),
+            component("fn-misc", "unrelated"),
+        ]);
+        let token_index = build_token_index(&index, &[]);
+        let hits = fuzzy_search(&token_index, "config");
+        let ids: Vec<&str> = hits.iter().map(|h| h.component_id.as_str()).collect();
+        assert!(ids.contains(&"fn-cfg"), "searching 'config' should find 'loadConfiguration', got: {ids:?}");
+        assert!(ids.contains(&"fn-set"), "searching 'config' should find 'configureApp', got: {ids:?}");
+    }
+
+    #[test]
+    fn alias_configuration_finds_config() {
+        let index = sample_index(vec![
+            component("fn-cfg", "config_loader"),
+            component("fn-misc", "unrelated"),
+        ]);
+        let token_index = build_token_index(&index, &[]);
+        let hits = fuzzy_search(&token_index, "configuration");
+        let ids: Vec<&str> = hits.iter().map(|h| h.component_id.as_str()).collect();
+        assert!(ids.contains(&"fn-cfg"), "searching 'configuration' should find 'config_loader', got: {ids:?}");
+    }
+
+    #[test]
+    fn alias_does_not_overpower_exact() {
+        let index = sample_index(vec![
+            component("fn-exact", "dead"),
+            component("fn-alias", "death_handler"),
+        ]);
+        let token_index = build_token_index(&index, &[]);
+        let hits = fuzzy_search(&token_index, "dead");
+        assert!(hits.len() >= 2);
+        assert_eq!(hits[0].component_id, "fn-exact", "exact match should rank first");
+        assert!(hits[0].score > hits[1].score, "exact score should be higher than alias score");
+    }
+
+    #[test]
+    fn stem_tion_strips_suffix() {
+        use super::stem;
+        let s_config = stem("configuration");
+        let s_delete = stem("deletion");
+        let s_create = stem("creation");
+        let s_execute = stem("execution");
+        assert!(!s_config.contains("tion"), "configuration stem should strip -ation: {s_config}");
+        assert!(!s_delete.contains("tion"), "deletion stem should strip -tion: {s_delete}");
+        assert!(!s_create.contains("tion"), "creation stem should strip -ation: {s_create}");
+        assert!(!s_execute.contains("tion"), "execution stem should strip -tion: {s_execute}");
+    }
+
+    #[test]
+    fn stem_th_strips_suffix() {
+        use super::stem;
+        assert_eq!(stem("death"), "dea");
+        assert_eq!(stem("growth"), "grow");
+        assert_eq!(stem("health"), "heal");
     }
 
     #[test]

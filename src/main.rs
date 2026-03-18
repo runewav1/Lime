@@ -6,6 +6,7 @@ mod chunk;
 mod commands;
 mod config;
 mod deps;
+mod diagnostics;
 #[allow(dead_code)]
 mod embeddings;
 mod format;

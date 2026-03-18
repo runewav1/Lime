@@ -24,6 +24,9 @@ pub struct LimeConfig {
     /// Embedding provider configuration.
     #[serde(default)]
     pub embeddings: EmbeddingConfig,
+    /// Diagnostics / static analysis configuration.
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
 }
 
 /// Controls which components are treated as alive seeds in death detection.
@@ -36,6 +39,25 @@ pub struct DeathSeedConfig {
     pub seed_names: Vec<String>,
     /// Component types that are always alive seeds.
     pub seed_types: Vec<String>,
+}
+
+/// Diagnostics / static analysis configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiagnosticsConfig {
+    /// Whether diagnostics integration is enabled.
+    pub enabled: bool,
+    /// Timeout in seconds per analyzer invocation.
+    pub timeout_secs: u64,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: 120,
+        }
+    }
 }
 
 /// Embedding provider configuration (extensible for local/remote).
@@ -99,6 +121,7 @@ impl Default for LimeConfig {
             ],
             death_seeds: DeathSeedConfig::default(),
             embeddings: EmbeddingConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
             index_storage: ".lime/index.json".to_string(),
         }
     }

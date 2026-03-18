@@ -2,6 +2,10 @@ use std::fmt::Write;
 use std::io::IsTerminal;
 
 use serde_json::Value;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
+use syntect::util::as_24_bit_terminal_escaped;
 
 // ── ANSI styling ────────────────────────────────────────────────
 
@@ -75,6 +79,7 @@ pub fn render(payload: &Value) -> String {
         "list" => render_list(payload, &s),
         "deps" => render_deps(payload, &s),
         "annotate" => render_annotate(payload, &s),
+        "show" => render_show(payload, &s),
         _ => serde_json::to_string_pretty(payload).unwrap_or_default(),
     }
 }
@@ -111,7 +116,7 @@ fn render_sync(v: &Value, s: &Style) -> String {
                 let _ = write!(out, " ({})", colored.join(", "));
             }
             if batman_count > 0 {
-                let _ = write!(out, " {}", s.yellow(&format!("[{batman_count} batman]")));
+                let _ = write!(out, " {}", s.bold_red(&format!("[{batman_count} dead]")));
             }
             if let Some(elapsed) = v.get("elapsed_secs").and_then(Value::as_f64) {
                 let _ = write!(out, " in {}", s.dim(&format_duration(elapsed)));
@@ -143,7 +148,7 @@ fn write_component_breakdown(out: &mut String, idx: &Value, s: &Style) {
         let _ = writeln!(
             out,
             "  {} {}",
-            s.yellow("[batman]"),
+            s.bold_red("[dead]"),
             s.dim(&format!("{batman_count} flagged"))
         );
     }
@@ -257,7 +262,7 @@ fn render_search(v: &Value, s: &Style) -> String {
             let _ = write!(out, "  {padded_label}  {padded_loc}  {}", s.dim(&ids[i]));
 
             if batman_flags[i] {
-                let _ = write!(out, " {}", s.dim("[batman]"));
+                let _ = write!(out, " {}", s.bold_red("[dead]"));
             }
 
             if fuzzy_mode && !match_types[i].is_empty() && match_types[i] != "exact" {
@@ -378,6 +383,15 @@ fn render_list_summary(v: &Value, s: &Style) -> String {
         cw = count_width
     );
 
+    let dead = num_val(v, "dead");
+    let faulty = num_val(v, "faulty");
+    if dead > 0 {
+        let _ = writeln!(out, "  {}", s.bold_red(&format!("{dead} dead")));
+    }
+    if faulty > 0 {
+        let _ = writeln!(out, "  {}", s.bold_red(&format!("{faulty} faulty")));
+    }
+
     out
 }
 
@@ -434,15 +448,28 @@ fn render_list_components(v: &Value, label: &str, s: &Style) -> String {
             let batman = bool_val(component, "batman");
             let padded = pad_styled(&styled_labels[i], plain_labels[i].len(), max_label);
             let batman_marker = if batman {
-                format!(" {}", s.dim("[batman]"))
+                format!(" {}", s.bold_red("[dead]"))
             } else {
                 String::new()
             };
+            let fault_total = component
+                .get("faults")
+                .and_then(|f| {
+                    let e = f.get("errors").and_then(Value::as_u64).unwrap_or(0);
+                    let w = f.get("warnings").and_then(Value::as_u64).unwrap_or(0);
+                    let n = f.get("notes").and_then(Value::as_u64).unwrap_or(0);
+                    let t = e + w + n;
+                    if t > 0 { Some(t) } else { None }
+                });
+            let fault_marker = fault_total
+                .map(|n| format!(" {}", s.bold_red(&format!("[{n} fault{}]", plural(n)))))
+                .unwrap_or_default();
             let _ = writeln!(
                 out,
-                "    {padded}  :{start}  {}{}",
+                "    {padded}  :{start}  {}{}{}",
                 s.dim(&id),
-                batman_marker
+                batman_marker,
+                fault_marker
             );
         }
     }
@@ -461,6 +488,171 @@ fn render_list_components(v: &Value, label: &str, s: &Style) -> String {
     out
 }
 
+// ── show ────────────────────────────────────────────────────────
+
+fn render_show(v: &Value, s: &Style) -> String {
+    let mut out = String::new();
+
+    if let Some(component) = v.get("component") {
+        let name = display_name(&str_val(component, "name"));
+        let ctype = str_val(component, "type");
+        let file = str_val(component, "file");
+        let start = num_val(component, "start_line");
+        let end = num_val(component, "end_line");
+        let id = str_val(component, "id");
+        let death = str_val(component, "death_status");
+        let dead = !death.is_empty() && death != "Alive";
+        let dead_marker = if dead {
+            format!(" {}", s.bold_red("[dead]"))
+        } else {
+            String::new()
+        };
+        let fault_total = component
+            .get("faults")
+            .and_then(|f| {
+                let e = f.get("errors").and_then(Value::as_u64).unwrap_or(0);
+                let w = f.get("warnings").and_then(Value::as_u64).unwrap_or(0);
+                let n = f.get("notes").and_then(Value::as_u64).unwrap_or(0);
+                let t = e + w + n;
+                if t > 0 { Some(t) } else { None }
+            });
+        let fault_marker = fault_total
+            .map(|n| format!(" {}", s.bold_red(&format!("[{n} fault{}]", plural(n)))))
+            .unwrap_or_default();
+
+        let _ = writeln!(
+            out,
+            "{} ({})  {file}:{start}-{end}  {}{}{}",
+            s.bold(&name),
+            s.cyan(&ctype),
+            s.dim(&id),
+            dead_marker,
+            fault_marker,
+        );
+    }
+
+    if bool_val(v, "file_changed") {
+        let _ = writeln!(out, "{}", s.yellow("(file changed since last sync)"));
+    }
+
+    let _ = writeln!(out);
+
+    if let Some(source_lines) = v.get("source_lines").and_then(Value::as_array) {
+        let lang = v
+            .get("component")
+            .and_then(|c| c.get("language"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        let ss = SyntaxSet::load_defaults_newlines();
+        let ts = ThemeSet::load_defaults();
+        let theme = &ts.themes["base16-ocean.dark"];
+        let syntax_ext = match lang {
+            "rust" => "rs",
+            "python" => "py",
+            "javascript" => "js",
+            "typescript" => "ts",
+            "go" => "go",
+            "c" => "c",
+            "cpp" => "cpp",
+            "zig" => "zig",
+            _ => "txt",
+        };
+        let syntax = ss
+            .find_syntax_by_extension(syntax_ext)
+            .unwrap_or_else(|| ss.find_syntax_plain_text());
+        let mut highlighter = HighlightLines::new(syntax, theme);
+
+        let max_line_num = source_lines
+            .last()
+            .and_then(|l| l.get("line"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let line_width = max_line_num.to_string().len().max(1);
+
+        for entry in source_lines {
+            let line_num = entry.get("line").and_then(Value::as_u64).unwrap_or(0);
+            let code = entry.get("code").and_then(Value::as_str).unwrap_or("");
+            let diags = entry.get("diagnostics").and_then(Value::as_array);
+
+            let has_error = diags
+                .map(|arr| arr.iter().any(|d| str_val(d, "severity") == "error"))
+                .unwrap_or(false);
+            let has_warning = diags
+                .map(|arr| arr.iter().any(|d| str_val(d, "severity") == "warning"))
+                .unwrap_or(false);
+
+            let status_tag = if has_error {
+                s.bold_red("error  ")
+            } else if has_warning {
+                s.yellow("warning")
+            } else {
+                "       ".to_string()
+            };
+
+            let highlighted = if s.enabled {
+                let line_with_nl = format!("{code}\n");
+                let ranges = highlighter
+                    .highlight_line(&line_with_nl, &ss)
+                    .unwrap_or_default();
+                let escaped = as_24_bit_terminal_escaped(&ranges, false);
+                escaped.trim_end().to_string()
+            } else {
+                code.to_string()
+            };
+
+            let _ = writeln!(
+                out,
+                " {:>lw$} {} {} {}",
+                line_num,
+                s.dim("|"),
+                status_tag,
+                highlighted,
+                lw = line_width,
+            );
+
+            if let Some(arr) = diags {
+                for d in arr {
+                    let sev = str_val(d, "severity");
+                    let msg = str_val(d, "message");
+                    let sev_label = match sev.as_str() {
+                        "error" => s.bold_red("error"),
+                        "warning" => s.yellow("warning"),
+                        "note" => s.cyan("note"),
+                        _ => s.dim(&sev),
+                    };
+                    let _ = writeln!(
+                        out,
+                        " {:>lw$} {} {} {}",
+                        "",
+                        s.dim("|"),
+                        sev_label,
+                        s.dim(&msg),
+                        lw = line_width,
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(ann) = v.get("annotation") {
+        if !ann.is_null() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "{}", s.bold("Annotation:"));
+            let content = str_val(ann, "content");
+            if content.is_empty() {
+                let _ = writeln!(out, "  {}", s.dim("(empty)"));
+            } else {
+                for line in content.lines() {
+                    let _ = writeln!(out, "  {line}");
+                }
+            }
+        }
+    }
+
+    out
+}
+
 // ── deps ────────────────────────────────────────────────────────
 
 fn render_deps(v: &Value, s: &Style) -> String {
@@ -474,7 +666,7 @@ fn render_deps(v: &Value, s: &Style) -> String {
         let id = str_val(component, "id");
         let batman = bool_val(component, "batman");
         let batman_marker = if batman {
-            format!(" {}", s.yellow("[batman]"))
+            format!(" {}", s.bold_red("[dead]"))
         } else {
             String::new()
         };
@@ -557,7 +749,7 @@ fn write_dep_nodes(out: &mut String, nodes: &[Value], s: &Style) {
         let padded_label = pad_styled(&styled_labels[i], plain_labels[i].len(), max_label);
         let padded_loc = pad_styled(&locations[i], locations[i].len(), max_loc);
         let batman_marker = if batman_flags[i] {
-            format!(" {}", s.yellow("[batman]"))
+            format!(" {}", s.bold_red("[dead]"))
         } else {
             String::new()
         };
@@ -785,7 +977,7 @@ fn write_index_summary(out: &mut String, v: &Value, s: &Style, include_batman: b
         let components = num_val(idx, "component_count");
         let batman_count = num_val(idx, "batman_count");
         let batman_suffix = if include_batman && batman_count > 0 {
-            format!(" {}", s.yellow(&format!("[{batman_count} batman]")))
+            format!(" {}", s.bold_red(&format!("[{batman_count} dead]")))
         } else {
             String::new()
         };

@@ -17,6 +17,7 @@ use crate::{
     batman,
     config::LimeConfig,
     deps,
+    diagnostics::ComponentFaults,
     parse::{detect_language, parse_components},
 };
 
@@ -127,6 +128,9 @@ pub struct ComponentRecord {
     /// Structured evidence for the death classification.
     #[serde(default)]
     pub death_evidence: DeathEvidence,
+    /// Aggregated static-analysis faults (populated during sync with --diagnostics).
+    #[serde(default)]
+    pub faults: ComponentFaults,
 }
 
 /// Result metadata for partial file updates.
@@ -445,6 +449,7 @@ fn build_indexed_file(
             batman: false,
             death_status: DeathStatus::Alive,
             death_evidence: DeathEvidence::default(),
+            faults: ComponentFaults::default(),
         });
     }
 
