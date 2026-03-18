@@ -425,11 +425,17 @@ fn is_dependency_target_type(component_type: &str) -> bool {
             | "def"
             | "async def"
             | "func"
+            | "typedef"
+            | "define"
+            | "namespace"
+            | "union"
+            | "test"
+            | "using"
     )
 }
 
 pub fn is_import_like_type(component_type: &str) -> bool {
-    matches!(component_type, "use" | "import" | "from")
+    matches!(component_type, "use" | "import" | "from" | "include")
 }
 
 fn is_import_noise(token: &str) -> bool {

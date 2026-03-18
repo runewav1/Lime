@@ -82,6 +82,72 @@ static PY_IMPORT_RE: LazyLock<Regex> =
 static PY_FROM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^\s*from\s+([A-Za-z0-9_\.]+)\s+import\s+([^\n#]+)").unwrap());
 
+// ---- Zig ----
+
+static ZIG_FN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(?:pub\s+|export\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap()
+});
+static ZIG_CONST_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(?:pub\s+)?const\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::|=)").unwrap()
+});
+static ZIG_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(?:pub\s+)?var\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::|=)").unwrap()
+});
+static ZIG_TEST_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?m)^\s*test\s+"([^"]+)""#).unwrap());
+static ZIG_STRUCT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(?:pub\s+)?const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:packed\s+|extern\s+)?struct\b").unwrap()
+});
+static ZIG_ENUM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(?:pub\s+)?const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*enum\b").unwrap()
+});
+static ZIG_UNION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(?:pub\s+)?const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:packed\s+|extern\s+)?union\b").unwrap()
+});
+static ZIG_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?m)^\s*(?:pub\s+)?const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*@import\("#).unwrap()
+});
+
+// ---- C ----
+
+static C_FUNC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^(?:static\s+|inline\s+|extern\s+)*(?:(?:unsigned|signed|long|short|const|volatile|struct|enum)\s+)*[A-Za-z_][A-Za-z0-9_*\s]*\s+\**([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)\s*\{"
+    ).unwrap()
+});
+static C_STRUCT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(?:typedef\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap()
+});
+static C_ENUM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(?:typedef\s+)?enum\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap()
+});
+static C_TYPEDEF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*typedef\s+[^;{]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*;").unwrap()
+});
+static C_DEFINE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap()
+});
+static C_INCLUDE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?m)^#\s*include\s+([<"][^>"]+[>"])"#).unwrap()
+});
+
+// ---- C++ (extends C) ----
+
+static CPP_CLASS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(?:template\s*<[^>]*>\s*)?class\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap()
+});
+static CPP_NAMESPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*namespace\s+([A-Za-z_][A-Za-z0-9_:]*)").unwrap()
+});
+static CPP_TEMPLATE_FUNC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*template\s*<[^>]*>\s*(?:static\s+|inline\s+|constexpr\s+)*[A-Za-z_][A-Za-z0-9_*&\s<>:]*\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap()
+});
+static CPP_USING_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*using\s+([A-Za-z_][A-Za-z0-9_]*)\s*=").unwrap()
+});
+
+// ---- Go ----
+
 static GO_STRUCT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+struct\b").unwrap());
 static GO_INTERFACE_RE: LazyLock<Regex> =
@@ -104,6 +170,9 @@ pub fn detect_language(extension: &str) -> Option<&'static str> {
         "ts" | "tsx" => Some("typescript"),
         "py" => Some("python"),
         "go" => Some("go"),
+        "zig" => Some("zig"),
+        "c" | "h" => Some("c"),
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Some("cpp"),
         _ => None,
     }
 }
@@ -117,6 +186,9 @@ pub fn parse_components(language: &str, content: &str) -> Vec<ParsedComponent> {
         "javascript" | "typescript" => parse_js_ts(content, language, &mut components),
         "python" => parse_python(content, &mut components),
         "go" => parse_go(content, &mut components),
+        "zig" => parse_zig(content, &mut components),
+        "c" => parse_c(content, &mut components),
+        "cpp" => parse_cpp(content, &mut components),
         _ => {}
     }
 
@@ -212,6 +284,60 @@ fn parse_go(content: &str, out: &mut Vec<ParsedComponent>) {
             ));
         }
     }
+}
+
+fn parse_zig(content: &str, out: &mut Vec<ParsedComponent>) {
+    collect_single_group(content, &ZIG_STRUCT_RE, "struct", out);
+    collect_single_group(content, &ZIG_ENUM_RE, "enum", out);
+    collect_single_group(content, &ZIG_UNION_RE, "union", out);
+    collect_single_group(content, &ZIG_IMPORT_RE, "import", out);
+    collect_single_group(content, &ZIG_TEST_RE, "test", out);
+
+    // fn/const/var — but skip entries already captured as struct/enum/union/import
+    let type_names: std::collections::HashSet<String> =
+        out.iter().map(|c| c.name.clone()).collect();
+
+    for captures in ZIG_FN_RE.captures_iter(content) {
+        if let (Some(matched), Some(name)) = (captures.get(0), captures.get(1)) {
+            let n = name.as_str().trim();
+            if !type_names.contains(n) {
+                out.push(ParsedComponent::new("fn", n, matched.start()));
+            }
+        }
+    }
+    for captures in ZIG_CONST_RE.captures_iter(content) {
+        if let (Some(matched), Some(name)) = (captures.get(0), captures.get(1)) {
+            let n = name.as_str().trim();
+            if !type_names.contains(n) {
+                out.push(ParsedComponent::new("const", n, matched.start()));
+            }
+        }
+    }
+    for captures in ZIG_VAR_RE.captures_iter(content) {
+        if let (Some(matched), Some(name)) = (captures.get(0), captures.get(1)) {
+            let n = name.as_str().trim();
+            if !type_names.contains(n) {
+                out.push(ParsedComponent::new("var", n, matched.start()));
+            }
+        }
+    }
+}
+
+fn parse_c(content: &str, out: &mut Vec<ParsedComponent>) {
+    collect_single_group(content, &C_STRUCT_RE, "struct", out);
+    collect_single_group(content, &C_ENUM_RE, "enum", out);
+    collect_single_group(content, &C_TYPEDEF_RE, "typedef", out);
+    collect_single_group(content, &C_DEFINE_RE, "define", out);
+    collect_single_group(content, &C_INCLUDE_RE, "include", out);
+    collect_single_group(content, &C_FUNC_RE, "fn", out);
+}
+
+fn parse_cpp(content: &str, out: &mut Vec<ParsedComponent>) {
+    parse_c(content, out);
+    collect_single_group(content, &CPP_CLASS_RE, "class", out);
+    collect_single_group(content, &CPP_NAMESPACE_RE, "namespace", out);
+    collect_single_group(content, &CPP_TEMPLATE_FUNC_RE, "fn", out);
+    collect_single_group(content, &CPP_USING_RE, "using", out);
 }
 
 fn collect_single_group(
@@ -414,4 +540,244 @@ fn extract_line(content: &str, start_offset: usize) -> &str {
         .map(|relative| start_offset + relative)
         .unwrap_or(content.len());
     &content[line_start..line_end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- detect_language ----
+
+    #[test]
+    fn detect_language_existing_languages() {
+        assert_eq!(detect_language("rs"), Some("rust"));
+        assert_eq!(detect_language("py"), Some("python"));
+        assert_eq!(detect_language("go"), Some("go"));
+        assert_eq!(detect_language("js"), Some("javascript"));
+        assert_eq!(detect_language("ts"), Some("typescript"));
+    }
+
+    #[test]
+    fn detect_language_zig() {
+        assert_eq!(detect_language("zig"), Some("zig"));
+    }
+
+    #[test]
+    fn detect_language_c() {
+        assert_eq!(detect_language("c"), Some("c"));
+        assert_eq!(detect_language("h"), Some("c"));
+    }
+
+    #[test]
+    fn detect_language_cpp() {
+        assert_eq!(detect_language("cpp"), Some("cpp"));
+        assert_eq!(detect_language("cc"), Some("cpp"));
+        assert_eq!(detect_language("cxx"), Some("cpp"));
+        assert_eq!(detect_language("hpp"), Some("cpp"));
+        assert_eq!(detect_language("hh"), Some("cpp"));
+        assert_eq!(detect_language("hxx"), Some("cpp"));
+    }
+
+    #[test]
+    fn detect_language_unknown() {
+        assert_eq!(detect_language("txt"), None);
+        assert_eq!(detect_language("md"), None);
+    }
+
+    // ---- Zig parsing ----
+
+    #[test]
+    fn zig_functions() {
+        let src = r#"
+pub fn init() void {
+}
+
+fn helper(x: u32) u32 {
+    return x + 1;
+}
+
+export fn entry() void {
+}
+"#;
+        let components = parse_components("zig", src);
+        let names: Vec<&str> = components.iter()
+            .filter(|c| c.component_type == "fn")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(names.contains(&"init"), "expected 'init' fn, got: {names:?}");
+        assert!(names.contains(&"helper"), "expected 'helper' fn, got: {names:?}");
+        assert!(names.contains(&"entry"), "expected 'entry' fn, got: {names:?}");
+    }
+
+    #[test]
+    fn zig_structs_enums_unions() {
+        let src = r#"
+const Point = struct {
+    x: f32,
+    y: f32,
+};
+
+pub const Color = enum {
+    red,
+    green,
+    blue,
+};
+
+const Payload = union {
+    int: i64,
+    float: f64,
+};
+"#;
+        let components = parse_components("zig", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("struct", "Point")), "expected struct Point, got: {types:?}");
+        assert!(types.contains(&("enum", "Color")), "expected enum Color, got: {types:?}");
+        assert!(types.contains(&("union", "Payload")), "expected union Payload, got: {types:?}");
+    }
+
+    #[test]
+    fn zig_consts_vars_imports_tests() {
+        let src = r#"
+const std = @import("std");
+const max_items = 100;
+var counter: u32 = 0;
+test "basic addition" {
+}
+"#;
+        let components = parse_components("zig", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("import", "std")), "expected import std, got: {types:?}");
+        assert!(types.contains(&("const", "max_items")), "expected const max_items, got: {types:?}");
+        assert!(types.contains(&("var", "counter")), "expected var counter, got: {types:?}");
+        assert!(types.contains(&("test", "basic addition")), "expected test, got: {types:?}");
+    }
+
+    // ---- C parsing ----
+
+    #[test]
+    fn c_functions() {
+        let src = r#"
+int main(int argc, char *argv[]) {
+    return 0;
+}
+
+static void helper(void) {
+}
+"#;
+        let components = parse_components("c", src);
+        let fns: Vec<&str> = components.iter()
+            .filter(|c| c.component_type == "fn")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(fns.contains(&"main"), "expected 'main', got: {fns:?}");
+        assert!(fns.contains(&"helper"), "expected 'helper', got: {fns:?}");
+    }
+
+    #[test]
+    fn c_structs_enums_typedefs() {
+        let src = r#"
+struct Point {
+    int x;
+    int y;
+};
+
+enum Color { RED, GREEN, BLUE };
+
+typedef unsigned long ulong;
+"#;
+        let components = parse_components("c", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("struct", "Point")), "expected struct Point, got: {types:?}");
+        assert!(types.contains(&("enum", "Color")), "expected enum Color, got: {types:?}");
+        assert!(types.contains(&("typedef", "ulong")), "expected typedef ulong, got: {types:?}");
+    }
+
+    #[test]
+    fn c_defines_and_includes() {
+        let src = r#"
+#include <stdio.h>
+#include "myheader.h"
+#define MAX_SIZE 1024
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+"#;
+        let components = parse_components("c", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("define", "MAX_SIZE")), "expected define MAX_SIZE, got: {types:?}");
+        assert!(types.contains(&("define", "MIN")), "expected define MIN, got: {types:?}");
+        let includes: Vec<&str> = components.iter()
+            .filter(|c| c.component_type == "include")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(includes.len(), 2, "expected 2 includes, got: {includes:?}");
+    }
+
+    // ---- C++ parsing ----
+
+    #[test]
+    fn cpp_classes_and_namespaces() {
+        let src = r#"
+namespace mylib {
+
+class Widget {
+public:
+    void draw();
+};
+
+}
+"#;
+        let components = parse_components("cpp", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("namespace", "mylib")), "expected namespace mylib, got: {types:?}");
+        assert!(types.contains(&("class", "Widget")), "expected class Widget, got: {types:?}");
+    }
+
+    #[test]
+    fn cpp_template_functions_and_using() {
+        let src = r#"
+template<typename T>
+T max_val(T a, T b) {
+    return a > b ? a : b;
+}
+
+using StringVec = std::vector<std::string>;
+"#;
+        let components = parse_components("cpp", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("fn", "max_val")), "expected fn max_val, got: {types:?}");
+        assert!(types.contains(&("using", "StringVec")), "expected using StringVec, got: {types:?}");
+    }
+
+    #[test]
+    fn cpp_inherits_c_parsing() {
+        let src = r#"
+#include <iostream>
+#define PI 3.14159
+
+struct Vec2 {
+    float x, y;
+};
+
+int main() {
+}
+"#;
+        let components = parse_components("cpp", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("include", "<iostream>")), "expected include <iostream>, got: {types:?}");
+        assert!(types.contains(&("define", "PI")), "expected define PI, got: {types:?}");
+        assert!(types.contains(&("struct", "Vec2")), "expected struct Vec2, got: {types:?}");
+    }
 }

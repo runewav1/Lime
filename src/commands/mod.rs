@@ -183,7 +183,7 @@ enum Commands {
     /// Format: lime search [language] [type] <query>
     /// Case-insensitive substring match on names, IDs, and file paths.
     ///
-    /// Languages: rust, javascript, typescript, python, go
+    /// Languages: rust, javascript, typescript, python, go, zig, c, cpp
     /// Types:     fn, struct, enum, trait, impl, class, def, func, and more
     ///
     /// Examples:
@@ -205,7 +205,7 @@ enum Commands {
     ///
     /// Format: lime list [language] [type | --all]
     ///
-    /// Languages: rust, javascript, typescript, python, go
+    /// Languages: rust, javascript, typescript, python, go, zig, c, cpp
     ///
     /// Examples:
     ///   "lime list"              list all indexed languages
@@ -1217,7 +1217,7 @@ fn normalize_language(value: &str) -> Result<String> {
 }
 
 fn supported_languages() -> Vec<&'static str> {
-    vec!["rust", "javascript", "typescript", "python", "go"]
+    vec!["rust", "javascript", "typescript", "python", "go", "zig", "c", "cpp"]
 }
 
 fn is_component_type_filter(value: &str) -> bool {
