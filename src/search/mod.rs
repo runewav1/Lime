@@ -115,27 +115,6 @@ impl MatchType {
 }
 
 // ---------------------------------------------------------------------------
-// Unified search hit (multi-channel)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchChannel {
-    LexicalName,
-    TokenFuzzy,
-    StemMatch,
-    AnnotationText,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct UnifiedSearchHit {
-    pub component_id: String,
-    pub score: f64,
-    pub match_type: MatchType,
-    pub channels: Vec<SearchChannel>,
-}
-
-// ---------------------------------------------------------------------------
 // Token index (in-memory, persistable)
 // ---------------------------------------------------------------------------
 
@@ -712,64 +691,6 @@ pub fn fuzzy_search(token_index: &SearchTokenIndex, query: &str) -> Vec<SearchHi
     });
 
     hits
-}
-
-// ---------------------------------------------------------------------------
-// Merge multiple search channels into unified hits
-// ---------------------------------------------------------------------------
-
-pub fn merge_search_hits(
-    lexical: &[SearchHit],
-    fuzzy: &[SearchHit],
-) -> Vec<UnifiedSearchHit> {
-    let mut map: HashMap<String, (f64, MatchType, Vec<SearchChannel>)> = HashMap::new();
-
-    for hit in lexical {
-        let entry = map.entry(hit.component_id.clone()).or_insert((0.0, MatchType::Exact, Vec::new()));
-        entry.0 += hit.score * 2.0;
-        if hit.match_type.rank() < entry.1.rank() {
-            entry.1 = hit.match_type;
-        }
-        if !entry.2.contains(&SearchChannel::LexicalName) {
-            entry.2.push(SearchChannel::LexicalName);
-        }
-    }
-
-    for hit in fuzzy {
-        let entry = map.entry(hit.component_id.clone()).or_insert((0.0, hit.match_type, Vec::new()));
-        entry.0 += hit.score;
-        if hit.match_type.rank() < entry.1.rank() {
-            entry.1 = hit.match_type;
-        }
-        let channel = match hit.match_type {
-            MatchType::Annotation => SearchChannel::AnnotationText,
-            MatchType::Stem => SearchChannel::StemMatch,
-            _ => SearchChannel::TokenFuzzy,
-        };
-        if !entry.2.contains(&channel) {
-            entry.2.push(channel);
-        }
-    }
-
-    let mut results: Vec<UnifiedSearchHit> = map
-        .into_iter()
-        .map(|(component_id, (score, match_type, channels))| UnifiedSearchHit {
-            component_id,
-            score,
-            match_type,
-            channels,
-        })
-        .collect();
-
-    results.sort_by(|a, b| {
-        a.match_type
-            .rank()
-            .cmp(&b.match_type.rank())
-            .then(b.score.total_cmp(&a.score))
-            .then(a.component_id.cmp(&b.component_id))
-    });
-
-    results
 }
 
 // ---------------------------------------------------------------------------

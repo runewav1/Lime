@@ -159,52 +159,6 @@ pub fn list_annotations(root: &Path) -> Result<Vec<Annotation>> {
     Ok(annotations)
 }
 
-pub fn list_annotations_for_type(root: &Path, component_type: &str) -> Result<Vec<Annotation>> {
-    let type_dir = annotations_dir(root).join(component_type);
-    if !type_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut annotations = Vec::new();
-    for entry in WalkDir::new(&type_dir)
-        .max_depth(1)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-
-        if entry.path().extension().and_then(|value| value.to_str()) != Some("md") {
-            continue;
-        }
-
-        let raw = fs::read_to_string(entry.path()).with_context(|| {
-            format!("failed reading annotation file: {}", entry.path().display())
-        })?;
-        let parsed = parse_annotation_file(&raw).with_context(|| {
-            format!("failed parsing annotation file: {}", entry.path().display())
-        })?;
-        annotations.push(parsed);
-    }
-
-    annotations.sort_by(|left, right| {
-        (
-            left.component_name.as_str(),
-            left.hash_id.as_str(),
-            left.updated_at.as_str(),
-        )
-            .cmp(&(
-                right.component_name.as_str(),
-                right.hash_id.as_str(),
-                right.updated_at.as_str(),
-            ))
-    });
-
-    Ok(annotations)
-}
-
 pub fn remove_annotation(root: &Path, component_id: &str) -> Result<bool> {
     let (component_type, hash_id) = parse_component_prefix(component_id);
     let path = annotation_path(root, &component_type, &hash_id);
@@ -217,11 +171,6 @@ pub fn remove_annotation(root: &Path, component_id: &str) -> Result<bool> {
         .with_context(|| format!("failed removing annotation file: {}", path.display()))?;
 
     Ok(true)
-}
-
-pub fn annotation_exists(root: &Path, component_id: &str) -> bool {
-    let (component_type, hash_id) = parse_component_prefix(component_id);
-    annotation_path(root, &component_type, &hash_id).exists()
 }
 
 pub fn parse_component_prefix(component_id: &str) -> (String, String) {

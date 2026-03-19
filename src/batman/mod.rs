@@ -27,21 +27,6 @@ pub struct DeathReport {
 /// Pass 2 — strict symbol reference validation across non-candidate files.
 /// Pass 3 — local-scope line-by-line validation within candidate files.
 /// Pass 4 — annotation-based retention (keep tags).
-pub fn detect_batman(
-    index: &mut IndexData,
-    file_contents: &HashMap<String, String>,
-) -> DeathReport {
-    detect_batman_with_seeds(index, file_contents, &DeathSeedConfig::default())
-}
-
-pub fn detect_batman_with_seeds(
-    index: &mut IndexData,
-    file_contents: &HashMap<String, String>,
-    seed_config: &DeathSeedConfig,
-) -> DeathReport {
-    detect_batman_full(index, file_contents, seed_config, &[])
-}
-
 pub fn detect_batman_full(
     index: &mut IndexData,
     file_contents: &HashMap<String, String>,

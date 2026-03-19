@@ -589,6 +589,338 @@ mod tests {
         assert_eq!(detect_language("md"), None);
     }
 
+    // ---- Rust parsing ----
+
+    #[test]
+    fn rust_structs_and_enums() {
+        let src = r#"
+pub struct Config {
+    name: String,
+}
+
+struct PrivateNode {
+    value: i32,
+}
+
+pub enum Status {
+    Active,
+    Inactive,
+}
+
+enum InternalError {
+    NotFound,
+    Timeout,
+}
+"#;
+        let components = parse_components("rust", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("struct", "Config")), "expected struct Config, got: {types:?}");
+        assert!(types.contains(&("struct", "PrivateNode")), "expected struct PrivateNode, got: {types:?}");
+        assert!(types.contains(&("enum", "Status")), "expected enum Status, got: {types:?}");
+        assert!(types.contains(&("enum", "InternalError")), "expected enum InternalError, got: {types:?}");
+    }
+
+    #[test]
+    fn rust_functions() {
+        let src = r#"
+fn helper() -> bool {
+    true
+}
+
+pub fn run(args: &[String]) {
+}
+
+pub(crate) fn internal_setup() {
+}
+
+pub async fn fetch_data(url: &str) -> Result<String> {
+    Ok(String::new())
+}
+"#;
+        let components = parse_components("rust", src);
+        let fns: Vec<&str> = components.iter()
+            .filter(|c| c.component_type == "fn")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(fns.contains(&"helper"), "expected 'helper', got: {fns:?}");
+        assert!(fns.contains(&"run"), "expected 'run', got: {fns:?}");
+        assert!(fns.contains(&"internal_setup"), "expected 'internal_setup', got: {fns:?}");
+        assert!(fns.contains(&"fetch_data"), "expected 'fetch_data', got: {fns:?}");
+    }
+
+    #[test]
+    fn rust_traits_and_impls() {
+        let src = r#"
+pub trait Drawable {
+    fn draw(&self);
+}
+
+impl Drawable for Widget {
+    fn draw(&self) {}
+}
+
+impl Widget {
+    fn new() -> Self { Widget }
+}
+"#;
+        let components = parse_components("rust", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.iter().any(|(t, _)| *t == "trait"), "expected a trait, got: {types:?}");
+        let impls: Vec<&str> = components.iter()
+            .filter(|c| c.component_type == "impl")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(impls.len() >= 2, "expected at least 2 impls, got: {impls:?}");
+    }
+
+    #[test]
+    fn rust_mods_and_uses() {
+        let src = r#"
+pub mod utils;
+mod internal;
+
+use std::collections::HashMap;
+use crate::config::LimeConfig;
+"#;
+        let components = parse_components("rust", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("mod", "utils")), "expected mod utils, got: {types:?}");
+        assert!(types.contains(&("mod", "internal")), "expected mod internal, got: {types:?}");
+        let uses: Vec<&str> = components.iter()
+            .filter(|c| c.component_type == "use")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(uses.len(), 2, "expected 2 use statements, got: {uses:?}");
+    }
+
+    // ---- JavaScript parsing ----
+
+    #[test]
+    fn js_classes_and_functions() {
+        let src = r#"
+class EventEmitter {
+    constructor() {}
+}
+
+export class Router {
+    navigate() {}
+}
+
+function handleRequest(req, res) {
+}
+
+export async function fetchUser(id) {
+}
+"#;
+        let components = parse_components("javascript", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("class", "EventEmitter")), "expected class EventEmitter, got: {types:?}");
+        assert!(types.contains(&("class", "Router")), "expected class Router, got: {types:?}");
+        assert!(types.contains(&("function", "handleRequest")), "expected function handleRequest, got: {types:?}");
+        assert!(types.contains(&("function", "fetchUser")), "expected function fetchUser, got: {types:?}");
+    }
+
+    #[test]
+    fn js_variables_and_exports() {
+        let src = r#"
+const API_URL = "https://example.com";
+let counter = 0;
+var legacy = true;
+export const MAX_RETRIES = 3;
+
+export { API_URL, counter as default };
+"#;
+        let components = parse_components("javascript", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("const", "API_URL")), "expected const API_URL, got: {types:?}");
+        assert!(types.contains(&("let", "counter")), "expected let counter, got: {types:?}");
+        assert!(types.contains(&("var", "legacy")), "expected var legacy, got: {types:?}");
+        assert!(types.contains(&("const", "MAX_RETRIES")), "expected const MAX_RETRIES, got: {types:?}");
+        let exports: Vec<&str> = components.iter()
+            .filter(|c| c.component_type == "export")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(exports.contains(&"API_URL"), "expected export API_URL, got: {exports:?}");
+        assert!(exports.contains(&"counter"), "expected export counter, got: {exports:?}");
+    }
+
+    // ---- TypeScript parsing ----
+
+    #[test]
+    fn ts_interfaces_and_types() {
+        let src = r#"
+export interface UserProfile {
+    name: string;
+    age: number;
+}
+
+interface InternalState {
+    loading: boolean;
+}
+
+export type UserId = string;
+type Callback = (err: Error) => void;
+
+class AppController {
+}
+
+function bootstrap() {
+}
+"#;
+        let components = parse_components("typescript", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("interface", "UserProfile")), "expected interface UserProfile, got: {types:?}");
+        assert!(types.contains(&("interface", "InternalState")), "expected interface InternalState, got: {types:?}");
+        assert!(types.contains(&("type", "UserId")), "expected type UserId, got: {types:?}");
+        assert!(types.contains(&("type", "Callback")), "expected type Callback, got: {types:?}");
+        assert!(types.contains(&("class", "AppController")), "expected class AppController, got: {types:?}");
+        assert!(types.contains(&("function", "bootstrap")), "expected function bootstrap, got: {types:?}");
+    }
+
+    // ---- Python parsing ----
+
+    #[test]
+    fn python_classes_and_defs() {
+        let src = r#"
+class UserService:
+    def __init__(self):
+        pass
+
+    def get_user(self, user_id):
+        pass
+
+class AdminService(UserService):
+    pass
+
+def standalone_helper():
+    return True
+
+async def fetch_remote(url):
+    return await get(url)
+"#;
+        let components = parse_components("python", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("class", "UserService")), "expected class UserService, got: {types:?}");
+        assert!(types.contains(&("class", "AdminService")), "expected class AdminService, got: {types:?}");
+        assert!(types.contains(&("def", "standalone_helper")), "expected def standalone_helper, got: {types:?}");
+        assert!(types.contains(&("async def", "fetch_remote")), "expected async def fetch_remote, got: {types:?}");
+        let defs: Vec<&str> = components.iter()
+            .filter(|c| c.component_type == "def")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(defs.contains(&"__init__"), "expected def __init__, got: {defs:?}");
+        assert!(defs.contains(&"get_user"), "expected def get_user, got: {defs:?}");
+    }
+
+    #[test]
+    fn python_imports() {
+        let src = r#"
+import os
+import sys
+from pathlib import Path
+from typing import List, Optional
+"#;
+        let components = parse_components("python", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        let imports: Vec<&str> = components.iter()
+            .filter(|c| c.component_type == "import")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(imports.len(), 2, "expected 2 imports, got: {imports:?}");
+        let froms: Vec<&str> = components.iter()
+            .filter(|c| c.component_type == "from")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(froms.len(), 2, "expected 2 from-imports, got: {froms:?}");
+        assert!(froms.iter().any(|f| f.starts_with("pathlib")), "expected pathlib from, got: {types:?}");
+        assert!(froms.iter().any(|f| f.starts_with("typing")), "expected typing from, got: {types:?}");
+    }
+
+    // ---- Go parsing ----
+
+    #[test]
+    fn go_structs_and_interfaces() {
+        let src = r#"
+type Server struct {
+    addr string
+    port int
+}
+
+type Handler interface {
+    ServeHTTP(w ResponseWriter, r *Request)
+}
+"#;
+        let components = parse_components("go", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("struct", "Server")), "expected struct Server, got: {types:?}");
+        assert!(types.contains(&("interface", "Handler")), "expected interface Handler, got: {types:?}");
+    }
+
+    #[test]
+    fn go_functions_and_methods() {
+        let src = r#"
+func main() {
+}
+
+func NewServer(addr string) *Server {
+    return &Server{addr: addr}
+}
+
+func (s *Server) Start() error {
+    return nil
+}
+"#;
+        let components = parse_components("go", src);
+        let funcs: Vec<&str> = components.iter()
+            .filter(|c| c.component_type == "func")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(funcs.contains(&"main"), "expected func main, got: {funcs:?}");
+        assert!(funcs.contains(&"NewServer"), "expected func NewServer, got: {funcs:?}");
+        assert!(funcs.contains(&"Start"), "expected method Start, got: {funcs:?}");
+    }
+
+    #[test]
+    fn go_consts_vars_types() {
+        let src = r#"
+const MaxRetries = 5
+var DefaultTimeout = 30
+
+type Duration int64
+type Callback func(error)
+"#;
+        let components = parse_components("go", src);
+        let types: Vec<(&str, &str)> = components.iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("const", "MaxRetries")), "expected const MaxRetries, got: {types:?}");
+        assert!(types.contains(&("var", "DefaultTimeout")), "expected var DefaultTimeout, got: {types:?}");
+        let type_aliases: Vec<&str> = components.iter()
+            .filter(|c| c.component_type == "type")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(type_aliases.contains(&"Duration"), "expected type Duration, got: {type_aliases:?}");
+        assert!(type_aliases.contains(&"Callback"), "expected type Callback, got: {type_aliases:?}");
+    }
+
     // ---- Zig parsing ----
 
     #[test]

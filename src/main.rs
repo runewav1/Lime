@@ -1,5 +1,4 @@
 mod annotations;
-#[allow(dead_code)]
 mod batman;
 mod commands;
 mod config;
@@ -9,9 +8,7 @@ mod format;
 mod git_staleness;
 mod index;
 mod parse;
-#[allow(dead_code)]
 mod search;
-#[allow(dead_code)]
 mod storage;
 
 fn main() {

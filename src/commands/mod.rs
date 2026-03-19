@@ -287,7 +287,6 @@ enum Commands {
 }
 
 #[derive(Debug, Subcommand)]
-/// Adding random line to test file change handling for annotations, re-sync component IDs test too.
 enum AnnotateAction {
     /// Add or update an annotation on a component.
     ///
@@ -351,19 +350,10 @@ enum ConfigAction {
     /// This prints the full JSON so it can be inspected or piped to tools.
     Show,
 
-    /// Update death seed configuration for the component death algorithm.
-    ///
-    /// Seed files / names / types are treated as always-alive roots.
-    /// Use the `--seed-*` flags to add new entries, and the `--clear-*`
-    /// flags to wipe existing lists entirely before adding.
-    ///
-    /// Examples:
-    ///   "lime config death-seeds --seed-file src/main.rs --seed-name main --seed-type fn"
-    ///   "lime config death-seeds --clear-seed-files --seed-file cmd/**"
     /// Update diagnostics configuration.
     ///
-    /// Controls whether static analysis runs during `lime list --diagnostics`
-    /// or `lime analyze`, and sets per-language tool preferences.
+    /// Controls whether static analysis runs during `lime sync --diagnostics`,
+    /// and sets per-language tool timeout.
     ///
     /// Examples:
     ///   "lime config diagnostics --enabled true"
@@ -377,6 +367,15 @@ enum ConfigAction {
         timeout: Option<u64>,
     },
 
+    /// Update death seed configuration for the component death algorithm.
+    ///
+    /// Seed files / names / types are treated as always-alive roots.
+    /// Use the `--seed-*` flags to add new entries, and the `--clear-*`
+    /// flags to wipe existing lists entirely before adding.
+    ///
+    /// Examples:
+    ///   "lime config death-seeds --seed-file src/main.rs --seed-name main --seed-type fn"
+    ///   "lime config death-seeds --clear-seed-files --seed-file cmd/**"
     DeathSeeds {
         /// Add file path patterns whose components are always alive seeds.
         #[arg(long = "seed-file")]
