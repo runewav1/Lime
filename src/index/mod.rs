@@ -18,7 +18,7 @@ use crate::{
     config::LimeConfig,
     deps,
     diagnostics::ComponentFaults,
-    parse::{detect_language, parse_components},
+    parse::{detect_language, parse_components, ParsedComponent},
 };
 
 /// Persistent codebase index written to storage.
@@ -30,6 +30,9 @@ pub struct IndexData {
     pub root: String,
     /// ISO timestamp for latest index generation.
     pub generated_at: String,
+    /// `git rev-parse HEAD` captured when the index was last saved (git work trees only).
+    #[serde(default)]
+    pub source_git_head: Option<String>,
     /// Detected languages across indexed files.
     pub languages: Vec<String>,
     /// Indexed file records.
@@ -167,6 +170,7 @@ impl IndexData {
             version: 1,
             root: normalize_path_string(root),
             generated_at: Utc::now().to_rfc3339(),
+            source_git_head: None,
             languages: Vec::new(),
             files: Vec::new(),
             components: Vec::new(),
@@ -430,19 +434,10 @@ fn build_indexed_file(
     let relative = relative_from_path(root, file_path)?;
     let parsed_components = parse_components(language, &content);
 
+    let component_ids = assign_component_ids(language, &relative, &parsed_components);
     let mut component_records = Vec::with_capacity(parsed_components.len());
-    let mut component_ids = Vec::with_capacity(parsed_components.len());
 
-    for component in parsed_components {
-        let id = build_component_id(
-            language,
-            &component.component_type,
-            &component.name,
-            &relative,
-            component.start_line,
-        );
-
-        component_ids.push(id.clone());
+    for (component, id) in parsed_components.into_iter().zip(component_ids.iter().cloned()) {
         component_records.push(ComponentRecord {
             id,
             language: language.to_string(),
@@ -526,12 +521,46 @@ fn remove_path_from_index(index: &mut IndexData, relative_path: &str) -> bool {
     removed || original_component_len != index.components.len()
 }
 
+/// Assigns stable component IDs for one source file.
+///
+/// IDs hash `language|component_type|name|file` and **omit** source line numbers so edits that
+/// only shift lines keep the same ID. If the same `(component_type, name)` appears more than once
+/// in a file, a **disambiguator** (0-based order by source byte offset) is included so symbols
+/// remain distinct.
+fn assign_component_ids(language: &str, file: &str, parsed: &[ParsedComponent]) -> Vec<String> {
+    let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    for (idx, p) in parsed.iter().enumerate() {
+        groups
+            .entry((p.component_type.clone(), p.name.clone()))
+            .or_default()
+            .push(idx);
+    }
+
+    let mut ids = vec![String::new(); parsed.len()];
+    for mut indices in groups.into_values() {
+        indices.sort_by_key(|&i| parsed[i].start_byte_offset());
+        let duplicate = indices.len() > 1;
+        for (ord, &idx) in indices.iter().enumerate() {
+            let p = &parsed[idx];
+            let disambig = if duplicate { Some(ord) } else { None };
+            ids[idx] = build_component_id(
+                language,
+                &p.component_type,
+                &p.name,
+                file,
+                disambig,
+            );
+        }
+    }
+    ids
+}
+
 fn build_component_id(
     language: &str,
     component_type: &str,
     name: &str,
     file: &str,
-    start_line: usize,
+    disambig: Option<usize>,
 ) -> String {
     let mut hasher = Hasher::new();
     hasher.update(language.as_bytes());
@@ -541,8 +570,10 @@ fn build_component_id(
     hasher.update(name.as_bytes());
     hasher.update(b"|");
     hasher.update(file.as_bytes());
-    hasher.update(b"|");
-    hasher.update(start_line.to_string().as_bytes());
+    if let Some(d) = disambig {
+        hasher.update(b"|");
+        hasher.update(d.to_string().as_bytes());
+    }
 
     let digest = hasher.finalize().to_hex().to_string();
     let prefix = component_prefix(component_type);
@@ -572,9 +603,7 @@ fn build_ignore_matcher(root: &Path, config: &LimeConfig) -> Result<Gitignore> {
     let gitignore_path = root.join(".gitignore");
 
     if gitignore_path.exists() {
-        if let Some(e) = builder.add(&gitignore_path) {
-            eprintln!("DEBUG: gitignore add error: {:?}", e);
-        }
+        let _ = builder.add(&gitignore_path);
     }
 
     for pattern in &config.ignore_patterns {
@@ -636,4 +665,32 @@ fn detect_path_language(path: &Path) -> Option<&'static str> {
 
 fn hash_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
+}
+
+#[cfg(test)]
+mod component_id_tests {
+    use super::*;
+    use crate::parse::parse_components;
+
+    #[test]
+    fn singleton_component_id_stable_when_prepended_comment() {
+        let before = "fn stable_fn() {}\n";
+        let after = "// comment\nfn stable_fn() {}\n";
+        let c1 = parse_components("rust", before);
+        let c2 = parse_components("rust", after);
+        let ids1 = assign_component_ids("rust", "src/a.rs", &c1);
+        let ids2 = assign_component_ids("rust", "src/a.rs", &c2);
+        assert_eq!(ids1.len(), 1, "{c1:?}");
+        assert_eq!(ids2.len(), 1, "{c2:?}");
+        assert_eq!(ids1[0], ids2[0]);
+    }
+
+    #[test]
+    fn duplicate_names_in_one_file_get_distinct_ids() {
+        let src = "fn dup() {}\nfn dup() {}\n";
+        let parsed = parse_components("rust", src);
+        assert_eq!(parsed.len(), 2);
+        let ids = assign_component_ids("rust", "src/b.rs", &parsed);
+        assert_ne!(ids[0], ids[1]);
+    }
 }

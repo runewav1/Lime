@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,6 +14,7 @@ use crate::{
     config::LimeConfig,
     deps,
     diagnostics,
+    git_staleness,
     index::{self, ComponentRecord, DeathStatus, IndexData},
     search::{self, MatchType},
     storage,
@@ -286,6 +287,7 @@ enum Commands {
 }
 
 #[derive(Debug, Subcommand)]
+/// Adding random line to test file change handling for annotations, re-sync component IDs test too.
 enum AnnotateAction {
     /// Add or update an annotation on a component.
     ///
@@ -413,6 +415,7 @@ fn handle_sync(
         let diag_result = run_and_attach_diagnostics(&root, &mut index, do_diag);
 
         let elapsed = timer.elapsed();
+        git_staleness::refresh_git_head_at_sync(&mut index, &root);
         storage::save_index(&root, &config, &index)?;
         persist_token_index(&root, &index);
 
@@ -421,7 +424,7 @@ fn handle_sync(
             "command": "sync",
             "scope": "full",
             "elapsed_secs": elapsed.as_secs_f64(),
-            "index": summarize_index(&index)
+            "index": index_payload_with_staleness(&root, &index)
         });
         if verbose {
             if let Some(obj) = response.as_object_mut() {
@@ -439,6 +442,7 @@ fn handle_sync(
     let diag_result = run_and_attach_diagnostics(&root, &mut updated, do_diag);
 
     let elapsed = timer.elapsed();
+    git_staleness::refresh_git_head_at_sync(&mut updated, &root);
     storage::save_index(&root, &config, &updated)?;
     persist_token_index(&root, &updated);
 
@@ -451,7 +455,7 @@ fn handle_sync(
             "files": files
         },
         "result": result,
-        "index": summarize_index(&updated)
+        "index": index_payload_with_staleness(&root, &updated)
     });
     if verbose {
         if let Some(obj) = response.as_object_mut() {
@@ -508,9 +512,11 @@ fn handle_add(root: PathBuf, filename: String) -> Result<Value> {
     let config = LimeConfig::load_or_create(&root)?;
     let current = storage::load_index_or_empty(&root, &config)?;
     let timer = std::time::Instant::now();
-    let (updated, result) = index::add_file(&root, &config, &filename, current)?;
+    let (mut updated, result) = index::add_file(&root, &config, &filename, current)?;
     let elapsed = timer.elapsed();
+    git_staleness::refresh_git_head_at_sync(&mut updated, &root);
     storage::save_index(&root, &config, &updated)?;
+    persist_token_index(&root, &updated);
 
     Ok(json!({
         "ok": true,
@@ -520,7 +526,7 @@ fn handle_add(root: PathBuf, filename: String) -> Result<Value> {
             "filename": filename
         },
         "result": result,
-        "index": summarize_index(&updated)
+        "index": index_payload_with_staleness(&root, &updated)
     }))
 }
 
@@ -528,10 +534,12 @@ fn handle_remove(root: PathBuf, filename: String) -> Result<Value> {
     let config = LimeConfig::load_or_create(&root)?;
     let current = storage::load_index_or_empty(&root, &config)?;
     let timer = std::time::Instant::now();
-    let (updated, removed) = index::remove_file(&root, &config, &filename, current)?;
+    let (mut updated, removed) = index::remove_file(&root, &config, &filename, current)?;
     let elapsed = timer.elapsed();
     if removed {
+        git_staleness::refresh_git_head_at_sync(&mut updated, &root);
         storage::save_index(&root, &config, &updated)?;
+        persist_token_index(&root, &updated);
     }
 
     Ok(json!({
@@ -542,7 +550,7 @@ fn handle_remove(root: PathBuf, filename: String) -> Result<Value> {
             "filename": filename
         },
         "removed": removed,
-        "index": summarize_index(&updated)
+        "index": index_payload_with_staleness(&root, &updated)
     }))
 }
 
@@ -635,6 +643,8 @@ fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value
     let config = LimeConfig::load_or_create(&root)?;
     let timer = std::time::Instant::now();
     let mut index = storage::load_index_or_empty(&root, &config)?;
+    let index_staleness =
+        serde_json::to_value(git_staleness::evaluate(&root, &index)).unwrap_or(json!({}));
 
     let normalized_query = query.query.to_ascii_lowercase();
     if index.search_index.is_none() {
@@ -743,7 +753,8 @@ fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value
             "query": query,
             "fuzzy": false,
             "result_count": results.len(),
-            "results": results
+            "results": results,
+            "index_staleness": index_staleness
         }));
     }
 
@@ -758,11 +769,13 @@ fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value
         Vec::new()
     };
 
-    let annotation_map: std::collections::HashMap<String, &annotations::Annotation> =
-        all_annotations
-            .iter()
-            .map(|a| (a.hash_id.clone(), a))
-            .collect();
+    let mut annotation_map: std::collections::HashMap<String, &annotations::Annotation> =
+        std::collections::HashMap::new();
+    for a in &all_annotations {
+        if let Some(c) = annotations::resolve_component_for_annotation(&index, a) {
+            annotation_map.insert(c.id.clone(), a);
+        }
+    }
 
     let component_map: std::collections::HashMap<&str, &ComponentRecord> = index
         .components
@@ -880,7 +893,8 @@ fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value
         "query": query,
         "fuzzy": fuzzy,
         "result_count": results_json.len(),
-        "results": results_json
+        "results": results_json,
+        "index_staleness": index_staleness
     }))
 }
 
@@ -911,6 +925,8 @@ fn handle_list(
     let config = LimeConfig::load_or_create(&root)?;
     let timer = std::time::Instant::now();
     let index = storage::load_index_or_empty(&root, &config)?;
+    let index_staleness =
+        serde_json::to_value(git_staleness::evaluate(&root, &index)).unwrap_or(json!({}));
 
     if matches!(component_type.as_deref(), Some("-all")) {
         all = true;
@@ -933,7 +949,8 @@ fn handle_list(
             "command": "list",
             "mode": "languages",
             "elapsed_secs": elapsed.as_secs_f64(),
-            "languages": index.languages
+            "languages": index.languages,
+            "index_staleness": index_staleness
         }));
     };
 
@@ -970,7 +987,8 @@ fn handle_list(
             "language": language,
             "type": component_type,
             "count": components.len(),
-            "components": components
+            "components": components,
+            "index_staleness": index_staleness
         }));
     }
 
@@ -1000,7 +1018,8 @@ fn handle_list(
             "elapsed_secs": elapsed.as_secs_f64(),
             "language": language,
             "count": components.len(),
-            "components": components
+            "components": components,
+            "index_staleness": index_staleness
         }));
     }
 
@@ -1028,13 +1047,16 @@ fn handle_list(
         "total": components.len(),
         "dead": dead_count,
         "faulty": faulty_count,
-        "component_counts": by_type
+        "component_counts": by_type,
+        "index_staleness": index_staleness
     }))
 }
 
 fn handle_show(root: PathBuf, component_id: String) -> Result<Value> {
     let config = LimeConfig::load_or_create(&root)?;
     let index = storage::load_index_or_empty(&root, &config)?;
+    let index_staleness =
+        serde_json::to_value(git_staleness::evaluate(&root, &index)).unwrap_or(json!({}));
 
     let component = index
         .components
@@ -1066,7 +1088,7 @@ fn handle_show(root: PathBuf, component_id: String) -> Result<Value> {
     let diag_cache = storage::load_diagnostics_cache(&root).unwrap_or_default();
     let diag_entries = diag_cache.get(&component_id).cloned().unwrap_or_default();
 
-    let annotation = annotations::load_annotation(&root, &component_id)?;
+    let annotation = annotations::find_annotation_for_component(&root, &index, &component)?;
 
     let mut source_line_data: Vec<Value> = Vec::new();
     for (i, line_text) in component_lines.iter().enumerate() {
@@ -1108,6 +1130,7 @@ fn handle_show(root: PathBuf, component_id: String) -> Result<Value> {
         "file_changed": file_changed,
         "source_lines": source_line_data,
         "annotation": annotation,
+        "index_staleness": index_staleness
     }))
 }
 
@@ -1115,6 +1138,8 @@ fn handle_deps(root: PathBuf, component_id: String, depth: Option<usize>) -> Res
     let config = LimeConfig::load_or_create(&root)?;
     let timer = std::time::Instant::now();
     let index = storage::load_index_or_empty(&root, &config)?;
+    let index_staleness =
+        serde_json::to_value(git_staleness::evaluate(&root, &index)).unwrap_or(json!({}));
     let effective_depth = depth.unwrap_or(config.default_dependency_depth);
 
     let root_component = index
@@ -1133,7 +1158,8 @@ fn handle_deps(root: PathBuf, component_id: String, depth: Option<usize>) -> Res
         "command": "deps",
         "elapsed_secs": elapsed.as_secs_f64(),
         "component": root_component,
-        "dependency_matrix": matrix
+        "dependency_matrix": matrix,
+        "index_staleness": index_staleness
     }))
 }
 
@@ -1155,7 +1181,8 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
                 .ok_or_else(|| anyhow!("component not found: {component_id}"))?;
 
             let now = chrono::Utc::now().to_rfc3339();
-            let existing = annotations::load_annotation(&root, &component_id)?;
+            let existing =
+                annotations::find_annotation_for_component(&root, &index, component)?;
             let created_at = existing
                 .as_ref()
                 .map(|a| a.created_at.clone())
@@ -1174,9 +1201,11 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
                 .unwrap_or(("component", &component_id));
 
             let annotation = annotations::Annotation {
-                hash_id: component_id.clone(),
+                hash_id: component.id.clone(),
                 component_type: comp_type.to_string(),
                 component_name: component.name.clone(),
+                file: Some(component.file.clone()),
+                language: Some(component.language.clone()),
                 content: message.clone(),
                 tags: merged_tags,
                 created_at,
@@ -1184,6 +1213,7 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
             };
 
             annotations::save_annotation(&root, &annotation)?;
+            persist_token_index(&root, &index);
             let elapsed = timer.elapsed();
 
             Ok(json!({
@@ -1208,7 +1238,7 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
                 .find(|c| c.id == component_id)
                 .ok_or_else(|| anyhow!("component not found: {component_id}"))?;
 
-            let annotation = annotations::load_annotation(&root, &component_id)?
+            let annotation = annotations::find_annotation_for_component(&root, &index, component)?
                 .ok_or_else(|| anyhow!("no annotation for component: {component_id}"))?;
             let elapsed = timer.elapsed();
 
@@ -1231,16 +1261,11 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
             component_type,
         } => {
             let all_annotations = annotations::list_annotations(&root)?;
-            let component_map: std::collections::HashMap<&str, &ComponentRecord> = index
-                .components
-                .iter()
-                .map(|c| (c.id.as_str(), c))
-                .collect();
 
             let filtered: Vec<Value> = all_annotations
                 .iter()
                 .filter_map(|ann| {
-                    let comp = component_map.get(ann.hash_id.as_str())?;
+                    let comp = annotations::resolve_component_for_annotation(&index, ann)?;
                     if let Some(lang) = &language {
                         if comp.language != *lang {
                             return None;
@@ -1277,6 +1302,9 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
         }
         AnnotateAction::Remove { component_id } => {
             let removed = annotations::remove_annotation(&root, &component_id)?;
+            if removed {
+                persist_token_index(&root, &index);
+            }
             let elapsed = timer.elapsed();
 
             Ok(json!({
@@ -1379,6 +1407,17 @@ fn is_component_type_filter(value: &str) -> bool {
     )
 }
 
+fn index_payload_with_staleness(root: &Path, index: &IndexData) -> Value {
+    let mut summary = summarize_index(index);
+    if let Some(obj) = summary.as_object_mut() {
+        obj.insert(
+            "index_staleness".to_string(),
+            serde_json::to_value(git_staleness::evaluate(root, index)).unwrap_or(json!({})),
+        );
+    }
+    summary
+}
+
 fn summarize_index(index: &IndexData) -> Value {
     let mut breakdown = BTreeMap::<String, BTreeMap<String, usize>>::new();
     for c in &index.components {
@@ -1429,6 +1468,7 @@ fn summarize_index(index: &IndexData) -> Value {
 }
 
 fn persist_token_index(root: &std::path::Path, index: &IndexData) {
+    let _ = annotations::reconcile_annotations_with_index(root, index);
     let all_annotations = annotations::list_annotations(root).unwrap_or_default();
     let token_index = search::build_token_index(index, &all_annotations);
     let _ = storage::save_token_index(root, &token_index);

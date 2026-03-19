@@ -18,6 +18,11 @@ pub struct ParsedComponent {
 }
 
 impl ParsedComponent {
+    /// Byte offset in source used to order duplicate `(type, name)` symbols in a file.
+    pub fn start_byte_offset(&self) -> usize {
+        self.start_offset
+    }
+
     fn new(
         component_type: impl Into<String>,
         name: impl Into<String>,

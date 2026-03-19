@@ -306,19 +306,16 @@ pub fn detect_batman_full(
 
     // --- Pass 4: annotation-based retention (keep tags) ---
 
-    let keep_ids: HashSet<&str> = annotations
-        .iter()
-        .filter(|a| a.has_keep_tag())
-        .map(|a| a.hash_id.as_str())
-        .collect();
-
     let mut pass4_rescued: HashSet<usize> = HashSet::new();
     for &candidate_idx in &pass1_candidates {
         if pass2_rescued.contains(&candidate_idx) || pass3_rescued.contains(&candidate_idx) {
             continue;
         }
-        let component_id = index.components[candidate_idx].id.as_str();
-        if keep_ids.contains(component_id) {
+        let component = &index.components[candidate_idx];
+        let kept = annotations.iter().filter(|a| a.has_keep_tag()).any(|a| {
+            a.hash_id == component.id || crate::annotations::annotation_applies_to_component(a, component)
+        });
+        if kept {
             pass4_rescued.insert(candidate_idx);
         }
     }

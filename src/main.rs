@@ -6,6 +6,7 @@ mod config;
 mod deps;
 mod diagnostics;
 mod format;
+mod git_staleness;
 mod index;
 mod parse;
 #[allow(dead_code)]

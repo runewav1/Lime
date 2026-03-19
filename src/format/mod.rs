@@ -71,6 +71,29 @@ fn pad_styled(styled: &str, plain_len: usize, width: usize) -> String {
     format!("{styled}{}", " ".repeat(pad))
 }
 
+// ── index staleness (git) ───────────────────────────────────────
+
+fn staleness_from_payload(v: &Value) -> Option<&Value> {
+    v.get("index_staleness")
+        .or_else(|| v.get("index").and_then(|i| i.get("index_staleness")))
+}
+
+fn write_staleness_banner(out: &mut String, v: &Value, s: &Style) {
+    let Some(st) = staleness_from_payload(v) else {
+        return;
+    };
+    if !st.get("is_stale").and_then(Value::as_bool).unwrap_or(false) {
+        return;
+    }
+    let reason = st
+        .get("reason_short")
+        .and_then(Value::as_str)
+        .filter(|r| !r.is_empty())
+        .unwrap_or("Index may be out of date; run `lime sync`.");
+    let _ = writeln!(out, "{} {}", s.bold("warning:"), s.yellow(reason));
+    let _ = writeln!(out);
+}
+
 // ── public API ──────────────────────────────────────────────────
 
 pub fn render(payload: &Value) -> String {
@@ -98,6 +121,7 @@ pub fn render_error(message: &str) -> String {
 
 fn render_sync(v: &Value, s: &Style) -> String {
     let mut out = String::new();
+    write_staleness_banner(&mut out, v, s);
     let scope = str_val(v, "scope");
     let verbose = v.get("verbose").and_then(Value::as_bool).unwrap_or(false);
 
@@ -178,6 +202,7 @@ fn write_component_breakdown(out: &mut String, idx: &Value, s: &Style) {
 
 fn render_add(v: &Value, s: &Style) -> String {
     let mut out = String::new();
+    write_staleness_banner(&mut out, v, s);
 
     if let Some(result) = v.get("result") {
         write_file_result(&mut out, result, s);
@@ -198,6 +223,7 @@ fn render_add(v: &Value, s: &Style) -> String {
 
 fn render_remove(v: &Value, s: &Style) -> String {
     let mut out = String::new();
+    write_staleness_banner(&mut out, v, s);
     let filename = v
         .get("request")
         .and_then(|r| r.get("filename"))
@@ -219,6 +245,7 @@ fn render_remove(v: &Value, s: &Style) -> String {
 
 fn render_search(v: &Value, s: &Style) -> String {
     let mut out = String::new();
+    write_staleness_banner(&mut out, v, s);
     let count = num_val(v, "result_count");
     let fuzzy_mode = v.get("fuzzy").and_then(Value::as_bool).unwrap_or(false);
 
@@ -300,13 +327,16 @@ fn render_search(v: &Value, s: &Style) -> String {
 // ── list ────────────────────────────────────────────────────────
 
 fn render_list(v: &Value, s: &Style) -> String {
-    match str_val(v, "mode").as_str() {
+    let mut out = String::new();
+    write_staleness_banner(&mut out, v, s);
+    let body = match str_val(v, "mode").as_str() {
         "languages" => render_list_languages(v, s),
         "language_summary" => render_list_summary(v, s),
         "language_all" => render_list_components(v, "all", s),
         "language_and_type" => render_list_components(v, &str_val(v, "type"), s),
         _ => serde_json::to_string_pretty(v).unwrap_or_default(),
-    }
+    };
+    out + &body
 }
 
 fn render_list_languages(v: &Value, s: &Style) -> String {
@@ -497,6 +527,7 @@ fn render_list_components(v: &Value, label: &str, s: &Style) -> String {
 
 fn render_show(v: &Value, s: &Style) -> String {
     let mut out = String::new();
+    write_staleness_banner(&mut out, v, s);
 
     if let Some(component) = v.get("component") {
         let name = display_name(&str_val(component, "name"));
@@ -646,6 +677,7 @@ fn render_show(v: &Value, s: &Style) -> String {
 
 fn render_deps(v: &Value, s: &Style) -> String {
     let mut out = String::new();
+    write_staleness_banner(&mut out, v, s);
 
     if let Some(component) = v.get("component") {
         let ctype = str_val(component, "type");

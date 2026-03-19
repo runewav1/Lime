@@ -511,7 +511,11 @@ pub fn build_token_index(index: &IndexData, annotations: &[Annotation]) -> Searc
     }
 
     for annotation in annotations {
-        if !valid_component_ids.contains(annotation.hash_id.as_str()) {
+        let Some(component) = crate::annotations::resolve_component_for_annotation(index, annotation)
+        else {
+            continue;
+        };
+        if !valid_component_ids.contains(component.id.as_str()) {
             continue;
         }
 
@@ -524,7 +528,7 @@ pub fn build_token_index(index: &IndexData, annotations: &[Annotation]) -> Searc
         }
 
         add_tokens(
-            &annotation.hash_id,
+            &component.id,
             ann_tokens,
             &mut token_to_components,
             &mut component_tokens,
@@ -1046,6 +1050,8 @@ mod tests {
             hash_id: "fn-file".to_string(),
             component_type: "fn".to_string(),
             component_name: "file_hash".to_string(),
+            file: None,
+            language: None,
             content: "Searchable **annotation** details".to_string(),
             tags: Vec::new(),
             created_at: "2026-03-17T00:00:00Z".to_string(),
@@ -1087,6 +1093,8 @@ mod tests {
             hash_id: "fn-notes".to_string(),
             component_type: "fn".to_string(),
             component_name: "notes".to_string(),
+            file: None,
+            language: None,
             content: "OAuth callback handling details".to_string(),
             tags: Vec::new(),
             created_at: "2026-03-17T00:00:00Z".to_string(),
@@ -1126,6 +1134,8 @@ mod tests {
             hash_id: "fn-notes".to_string(),
             component_type: "fn".to_string(),
             component_name: "notes".to_string(),
+            file: None,
+            language: None,
             content: "Parse behavior overview".to_string(),
             tags: Vec::new(),
             created_at: "2026-03-17T00:00:00Z".to_string(),
@@ -1192,6 +1202,7 @@ mod tests {
             version: 1,
             root: ".".to_string(),
             generated_at: "2026-03-17T00:00:00Z".to_string(),
+            source_git_head: None,
             languages: vec!["rust".to_string()],
             files: Vec::new(),
             components,
