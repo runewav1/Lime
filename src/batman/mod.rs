@@ -139,14 +139,10 @@ pub fn detect_batman_full(
             .seed_files
             .iter()
             .any(|pat| component.file.contains(pat.as_str()));
-        let is_config_seed_name = seed_config
-            .seed_names
-            .iter()
-            .any(|name| component.name == *name);
+        let is_config_seed_name = seed_config.seed_names.contains(&component.name);
         let is_config_seed_type = seed_config
             .seed_types
-            .iter()
-            .any(|ct| component.component_type == *ct);
+            .contains(&component.component_type);
 
         if is_entry_by_name
             || is_entry_by_file
@@ -196,9 +192,9 @@ pub fn detect_batman_full(
             // Check if all dependency parents are also candidates
             let all_parents_candidate = component.used_by_after.is_empty()
                 || component.used_by_after.iter().all(|parent_id| {
-                    id_to_idx.get(parent_id.as_str()).map_or(true, |&pi| {
-                        !main_islands.contains(&island_of[pi])
-                    })
+                    id_to_idx
+                        .get(parent_id.as_str())
+                        .is_none_or(|&pi| !main_islands.contains(&island_of[pi]))
                 });
             if all_parents_candidate && !component.used_by_after.is_empty() {
                 reasons.push(DeathReason::AllParentsDeadCandidates);

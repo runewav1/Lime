@@ -58,6 +58,11 @@ impl Style {
     fn bold_green(&self, t: &str) -> String {
         self.wrap(t, "1;32")
     }
+
+    fn gray(&self, t: &str) -> String {
+        // "Bright black" (often renders as a readable gray).
+        self.wrap(t, "90")
+    }
 }
 
 /// Right-pad a styled string using its plain-text width for measurement.
@@ -575,21 +580,6 @@ fn render_show(v: &Value, s: &Style) -> String {
             let code = entry.get("code").and_then(Value::as_str).unwrap_or("");
             let diags = entry.get("diagnostics").and_then(Value::as_array);
 
-            let has_error = diags
-                .map(|arr| arr.iter().any(|d| str_val(d, "severity") == "error"))
-                .unwrap_or(false);
-            let has_warning = diags
-                .map(|arr| arr.iter().any(|d| str_val(d, "severity") == "warning"))
-                .unwrap_or(false);
-
-            let status_tag = if has_error {
-                s.bold_red("error  ")
-            } else if has_warning {
-                s.yellow("warning")
-            } else {
-                "       ".to_string()
-            };
-
             let highlighted = if s.enabled {
                 let line_with_nl = format!("{code}\n");
                 let ranges = highlighter
@@ -603,10 +593,9 @@ fn render_show(v: &Value, s: &Style) -> String {
 
             let _ = writeln!(
                 out,
-                " {:>lw$} {} {} {}",
+                " {:>lw$} {} {}",
                 line_num,
                 s.dim("|"),
-                status_tag,
                 highlighted,
                 lw = line_width,
             );
@@ -627,7 +616,7 @@ fn render_show(v: &Value, s: &Style) -> String {
                         "",
                         s.dim("|"),
                         sev_label,
-                        s.dim(&msg),
+                        s.gray(&msg),
                         lw = line_width,
                     );
                 }

@@ -55,19 +55,26 @@ pub struct IndexedFile {
 }
 
 /// Tiered classification of component liveness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DeathStatus {
+    #[default]
     Alive,
     MaybeDead,
     ProbablyDead,
     DefinitelyDead,
-}
-
-impl Default for DeathStatus {
-    fn default() -> Self {
-        Self::Alive
-    }
 }
 
 impl DeathStatus {

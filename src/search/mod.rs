@@ -88,7 +88,6 @@ pub enum MatchType {
     Stem,
     Fuzzy,
     Annotation,
-    Embedding,
 }
 
 impl MatchType {
@@ -100,7 +99,6 @@ impl MatchType {
             MatchType::Stem => "stem",
             MatchType::Fuzzy => "fuzzy",
             MatchType::Annotation => "annotation",
-            MatchType::Embedding => "embedding",
         }
     }
 
@@ -112,7 +110,6 @@ impl MatchType {
             MatchType::Stem => 3,
             MatchType::Fuzzy => 4,
             MatchType::Annotation => 5,
-            MatchType::Embedding => 6,
         }
     }
 }
@@ -128,7 +125,6 @@ pub enum SearchChannel {
     TokenFuzzy,
     StemMatch,
     AnnotationText,
-    Embedding,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -325,19 +321,16 @@ pub fn stem(word: &str) -> String {
     } else if s.ends_with("ies") && s.len() > 4 {
         s.truncate(s.len() - 3);
         s.push('y');
-    } else if s.ends_with("ness") && s.len() > 5 {
-        s.truncate(s.len() - 4);
-    } else if s.ends_with("ment") && s.len() > 5 {
-        s.truncate(s.len() - 4);
-    } else if s.ends_with("able") && s.len() > 5 {
-        s.truncate(s.len() - 4);
-    } else if s.ends_with("ible") && s.len() > 5 {
-        s.truncate(s.len() - 4);
     } else if s.ends_with("ation") && s.len() > 6 {
         s.truncate(s.len() - 5);
-    } else if s.ends_with("tion") && s.len() > 5 {
-        s.truncate(s.len() - 4);
-    } else if s.ends_with("sion") && s.len() > 5 {
+    } else if (s.ends_with("ness")
+        || s.ends_with("ment")
+        || s.ends_with("able")
+        || s.ends_with("ible")
+        || s.ends_with("tion")
+        || s.ends_with("sion"))
+        && s.len() > 5
+    {
         s.truncate(s.len() - 4);
     } else if s.ends_with("ence") || s.ends_with("ance") {
         // keep: these are root forms (dependence, performance)
@@ -358,9 +351,7 @@ pub fn stem(word: &str) -> String {
         if bytes.len() >= 2 && bytes[bytes.len() - 1] == bytes[bytes.len() - 2] {
             s.pop();
         }
-    } else if s.ends_with("er") && s.len() > 4 && !s.ends_with("eer") {
-        s.truncate(s.len() - 2);
-    } else if s.ends_with("ly") && s.len() > 4 {
+    } else if ((s.ends_with("er") && !s.ends_with("eer")) || s.ends_with("ly")) && s.len() > 4 {
         s.truncate(s.len() - 2);
     } else if s.ends_with("es") && s.len() > 4 {
         // dependencies → dependenci → apply 'ies' rule won't catch it since we
@@ -402,8 +393,8 @@ fn edit_distance(a: &str, b: &str, max: usize) -> Option<usize> {
     let mut prev = vec![0usize; b_len + 1];
     let mut curr = vec![0usize; b_len + 1];
 
-    for j in 0..=b_len {
-        prev[j] = j;
+    for (j, slot) in prev.iter_mut().enumerate().take(b_len + 1) {
+        *slot = j;
     }
 
     let a_bytes = a.as_bytes();
@@ -619,12 +610,9 @@ pub fn fuzzy_search(token_index: &SearchTokenIndex, query: &str) -> Vec<SearchHi
             Box::new(token_index.all_tokens())
         } else {
             Box::new(
-                candidates.iter().filter_map(|tok| {
-                    token_index
-                        .token_to_components
-                        .get_key_value(tok)
-                        .map(|(k, v)| (k, v))
-                })
+                candidates
+                    .iter()
+                    .filter_map(|tok| token_index.token_to_components.get_key_value(tok))
             )
         };
 
@@ -729,7 +717,6 @@ pub fn fuzzy_search(token_index: &SearchTokenIndex, query: &str) -> Vec<SearchHi
 pub fn merge_search_hits(
     lexical: &[SearchHit],
     fuzzy: &[SearchHit],
-    embedding: &[SearchHit],
 ) -> Vec<UnifiedSearchHit> {
     let mut map: HashMap<String, (f64, MatchType, Vec<SearchChannel>)> = HashMap::new();
 
@@ -757,17 +744,6 @@ pub fn merge_search_hits(
         };
         if !entry.2.contains(&channel) {
             entry.2.push(channel);
-        }
-    }
-
-    for hit in embedding {
-        let entry = map.entry(hit.component_id.clone()).or_insert((0.0, hit.match_type, Vec::new()));
-        entry.0 += hit.score;
-        if hit.match_type.rank() < entry.1.rank() {
-            entry.1 = hit.match_type;
-        }
-        if !entry.2.contains(&SearchChannel::Embedding) {
-            entry.2.push(SearchChannel::Embedding);
         }
     }
 

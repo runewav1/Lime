@@ -1,14 +1,10 @@
 mod annotations;
 #[allow(dead_code)]
 mod batman;
-#[allow(dead_code)]
-mod chunk;
 mod commands;
 mod config;
 mod deps;
 mod diagnostics;
-#[allow(dead_code)]
-mod embeddings;
 mod format;
 mod index;
 mod parse;
