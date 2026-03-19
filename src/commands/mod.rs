@@ -1468,8 +1468,8 @@ fn summarize_index(index: &IndexData) -> Value {
 }
 
 fn persist_token_index(root: &std::path::Path, index: &IndexData) {
-    let _ = annotations::reconcile_annotations_with_index(root, index);
-    let all_annotations = annotations::list_annotations(root).unwrap_or_default();
+    let all_annotations = annotations::reconcile_annotations_with_index(root, index)
+        .unwrap_or_else(|_| annotations::list_annotations(root).unwrap_or_default());
     let token_index = search::build_token_index(index, &all_annotations);
     let _ = storage::save_token_index(root, &token_index);
 }

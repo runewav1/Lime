@@ -386,15 +386,17 @@ pub fn find_annotation_for_component(
 
 /// After indexing, rewrites annotation files so `hash_id` matches the current component ID and
 /// [`Annotation::file`] / [`Annotation::language`] are populated.
-pub fn reconcile_annotations_with_index(root: &Path, index: &IndexData) -> Result<()> {
-    let batch = list_annotations(root)?;
-    for ann in batch {
+///
+/// Returns the up-to-date annotation list (single disk walk) for callers that build derived indexes.
+pub fn reconcile_annotations_with_index(root: &Path, index: &IndexData) -> Result<Vec<Annotation>> {
+    let mut batch = list_annotations(root)?;
+    for ann in batch.iter_mut() {
         let old_path = {
             let (t, h) = parse_component_prefix(&ann.hash_id);
             annotation_path(root, &t, &h)
         };
 
-        let Some(component) = resolve_component_for_annotation(index, &ann) else {
+        let Some(component) = resolve_component_for_annotation(index, ann) else {
             continue;
         };
 
@@ -405,7 +407,7 @@ pub fn reconcile_annotations_with_index(root: &Path, index: &IndexData) -> Resul
             continue;
         }
 
-        let mut updated = ann;
+        let mut updated = ann.clone();
         updated.hash_id = component.id.clone();
         updated.file = Some(component.file.clone());
         updated.language = Some(component.language.clone());
@@ -420,8 +422,10 @@ pub fn reconcile_annotations_with_index(root: &Path, index: &IndexData) -> Resul
         if old_path != new_path && old_path.exists() {
             let _ = fs::remove_file(&old_path);
         }
+
+        *ann = updated;
     }
-    Ok(())
+    Ok(batch)
 }
 
 #[cfg(test)]

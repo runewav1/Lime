@@ -41,13 +41,22 @@ pub fn refresh_git_head_at_sync(index: &mut IndexData, root: &Path) {
 }
 
 fn read_head_if_git_repo(root: &Path) -> Option<String> {
-    match git_output(root, &["rev-parse", "--is-inside-work-tree"]) {
-        Ok(s) if s.trim() == "true" => {}
-        _ => return None,
+    let out = git_output(root, &["rev-parse", "--is-inside-work-tree", "HEAD"]).ok()?;
+    parse_inside_and_head(out).1
+}
+
+/// Parses `git rev-parse is-inside-work-tree HEAD` stdout: line1 `true`/`false`, line2 SHA (if any).
+fn parse_inside_and_head(stdout: String) -> (bool, Option<String>) {
+    let mut lines = stdout.lines();
+    let Some(first) = lines.next() else {
+        return (false, None);
+    };
+    let inside = first.trim() == "true";
+    if !inside {
+        return (false, None);
     }
-    git_output(root, &["rev-parse", "HEAD"])
-        .ok()
-        .map(|s| s.trim().to_string())
+    let head = lines.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    (true, head)
 }
 
 /// Computes staleness for commands that load an index from disk (list, search, show, deps, etc.).
@@ -71,8 +80,8 @@ pub fn evaluate(root: &Path, index: &IndexData) -> GitStalenessReport {
         is_stale: false,
     };
 
-    let inside = match git_output(root, &["rev-parse", "--is-inside-work-tree"]) {
-        Ok(s) => s.trim() == "true",
+    let (inside, head_current) = match git_output(root, &["rev-parse", "--is-inside-work-tree", "HEAD"]) {
+        Ok(s) => parse_inside_and_head(s),
         Err(e) => {
             report.git_error = Some(e);
             report.git_available = false;
@@ -86,10 +95,10 @@ pub fn evaluate(root: &Path, index: &IndexData) -> GitStalenessReport {
 
     report.git_repo = true;
 
-    let head_current = match git_output(root, &["rev-parse", "HEAD"]) {
-        Ok(s) => Some(s.trim().to_string()),
-        Err(e) => {
-            report.git_error = Some(e);
+    let head_current = match head_current {
+        Some(h) => Some(h),
+        None => {
+            report.git_error = Some("git rev-parse HEAD produced no output".to_string());
             return report;
         }
     };
@@ -181,27 +190,46 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Paths that differ from `HEAD` or are untracked (respecting exclude rules), repo-relative, `/`-separated.
+/// Paths with working-tree changes vs `HEAD` or untracked (non-ignored), repo-relative, `/`-separated.
+/// Uses a single `git status --porcelain` to avoid multiple subprocess round-trips.
 fn git_dirty_paths(root: &Path) -> Result<HashSet<String>, String> {
+    let out = git_output(root, &["status", "--porcelain=v1"])?;
+    Ok(parse_status_porcelain_paths(&out))
+}
+
+fn parse_status_porcelain_paths(porcelain: &str) -> HashSet<String> {
     let mut paths = HashSet::new();
-
-    let diff = git_output(root, &["diff", "--name-only", "HEAD"])?;
-    for line in diff.lines() {
-        let p = line.trim();
-        if !p.is_empty() {
-            paths.insert(normalize_path_str(p));
+    for line in porcelain.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        // `?? path` (untracked)
+        if line.starts_with("?? ") {
+            if let Some(p) = line.get(3..) {
+                paths.insert(normalize_path_str(p.trim()));
+            }
+            continue;
+        }
+        // `XY path` — first two columns are status; path starts after a space.
+        if line.len() < 4 {
+            continue;
+        }
+        let rest = line.get(3..).unwrap_or("").trim();
+        if rest.is_empty() {
+            continue;
+        }
+        // Rename: `R  old -> new` or `R  old -> new` with spaces
+        if rest.contains(" -> ") {
+            if let Some((a, b)) = rest.split_once(" -> ") {
+                paths.insert(normalize_path_str(a.trim()));
+                paths.insert(normalize_path_str(b.trim()));
+            }
+        } else {
+            paths.insert(normalize_path_str(rest));
         }
     }
-
-    let untracked = git_output(root, &["ls-files", "--others", "--exclude-standard"])?;
-    for line in untracked.lines() {
-        let p = line.trim();
-        if !p.is_empty() {
-            paths.insert(normalize_path_str(p));
-        }
-    }
-
-    Ok(paths)
+    paths
 }
 
 fn normalize_path_str(s: &str) -> String {
@@ -219,5 +247,22 @@ mod tests {
     #[test]
     fn normalize_path_str_flips_backslashes() {
         assert_eq!(normalize_path_str(r"a\b\c"), "a/b/c");
+    }
+
+    #[test]
+    fn parse_inside_and_head_two_lines() {
+        let (inside, h) = parse_inside_and_head("true\nabc123def\n".to_string());
+        assert!(inside);
+        assert_eq!(h.as_deref(), Some("abc123def"));
+    }
+
+    #[test]
+    fn parse_status_porcelain_collects_paths() {
+        let sample = " M src/a.rs\n?? b.txt\nR  old.rs -> new.rs\n";
+        let p = parse_status_porcelain_paths(sample);
+        assert!(p.contains("src/a.rs"));
+        assert!(p.contains("b.txt"));
+        assert!(p.contains("old.rs"));
+        assert!(p.contains("new.rs"));
     }
 }
