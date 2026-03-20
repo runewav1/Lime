@@ -9,6 +9,7 @@ mod git_staleness;
 mod index;
 mod links;
 mod parse;
+mod projects_registry;
 mod search;
 mod storage;
 

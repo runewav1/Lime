@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 const CONFIG_FILE: &str = ".lime/lime.json";
+const GLOBAL_CONFIG_SUBPATH: &str = "lime/lime.json";
 
 fn default_index_pretty() -> bool {
     true
@@ -105,7 +106,12 @@ impl Default for LimeConfig {
 }
 
 impl LimeConfig {
-    /// Loads config from `.lime/lime.json`, creating it with defaults if absent.
+    /// Loads config from `.lime/lime.json`.
+    ///
+    /// When no project config exists yet (first `lime init` / `lime sync`), the
+    /// **global config** (`~/.config/lime/lime.json`) is used as the starting
+    /// template so user preferences carry over automatically.  If no global
+    /// config exists either, hard-coded defaults are used.
     pub fn load_or_create(root: &Path) -> Result<Self> {
         let path = Self::config_path(root);
 
@@ -118,10 +124,59 @@ impl LimeConfig {
             return Ok(parsed);
         }
 
-        let mut config = Self::default();
+        // New project — seed from global config, fall back to compiled defaults.
+        let mut config = Self::load_global().unwrap_or_default();
+        // Always reset the storage path to the project-relative default so a
+        // global `index_storage` override from one repo doesn't pollute another.
+        config.index_storage = ".lime/index.json".to_string();
         config.ensure_default_ignores();
         config.save(root)?;
         Ok(config)
+    }
+
+    /// Returns the path to the global config file (`~/.config/lime/lime.json`).
+    ///
+    /// Returns `None` when the platform config directory cannot be determined.
+    pub fn global_config_path() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join(GLOBAL_CONFIG_SUBPATH))
+    }
+
+    /// Loads the global config.
+    ///
+    /// Returns `LimeConfig::default()` (silently) when the file does not exist
+    /// or the platform config dir is unavailable.
+    pub fn load_global() -> Result<Self> {
+        let Some(path) = Self::global_config_path() else {
+            return Ok(Self::default());
+        };
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("failed reading global config: {}", path.display()))?;
+        let mut parsed: Self = serde_json::from_str(&content)
+            .with_context(|| format!("failed parsing global config JSON: {}", path.display()))?;
+        parsed.ensure_default_ignores();
+        Ok(parsed)
+    }
+
+    /// Persists `self` as the global config (`~/.config/lime/lime.json`).
+    pub fn save_global(&self) -> Result<()> {
+        let path = Self::global_config_path()
+            .context("cannot determine platform config directory for global config")?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed creating global config directory: {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let serialized =
+            serde_json::to_string_pretty(self).context("failed serializing global lime config")?;
+        fs::write(&path, serialized)
+            .with_context(|| format!("failed writing global config: {}", path.display()))?;
+        Ok(())
     }
 
     /// Persists current configuration to `.lime/lime.json`.
@@ -139,7 +194,7 @@ impl LimeConfig {
         Ok(())
     }
 
-    /// Returns path to the config file.
+    /// Returns path to the project config file.
     pub fn config_path(root: &Path) -> PathBuf {
         root.join(CONFIG_FILE)
     }

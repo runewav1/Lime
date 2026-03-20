@@ -18,6 +18,7 @@ use crate::{
     git_staleness,
     index::{self, ComponentRecord, DeathStatus, IndexData},
     links,
+    projects_registry,
     search::{self, MatchType},
     storage,
 };
@@ -55,6 +56,7 @@ pub fn run() -> Result<()> {
         Err(e) => exit_error(&format!("failed reading current directory: {e}"), json_mode),
     };
 
+    let external = cli.external.clone();
     let result = match cli.command {
         Commands::Sync {
             files,
@@ -62,29 +64,79 @@ pub fn run() -> Result<()> {
             verbose,
             git,
             no_git,
-        } => handle_sync(root, files, diagnostics, verbose, git, no_git),
-        Commands::Add { filename } => handle_add(root, filename),
-        Commands::Remove { filename } => handle_remove(root, filename),
-        Commands::Search {
-            terms,
-            fuzzy,
-        } => handle_search(root, terms, fuzzy),
-        Commands::Links { action } => handle_links(root, action),
-        Commands::Sum { top_links } => handle_sum(root, top_links),
+        } => {
+            ensure_external_disabled("sync", external.as_deref())?;
+            handle_sync(root, files, diagnostics, verbose, git, no_git)
+        }
+        Commands::Add { filename } => {
+            ensure_external_disabled("add", external.as_deref())?;
+            handle_add(root, filename)
+        }
+        Commands::Remove { filename } => {
+            ensure_external_disabled("remove", external.as_deref())?;
+            handle_remove(root, filename)
+        }
+        Commands::Search { terms, fuzzy } => {
+            let target = resolve_command_target(&root, external.clone())?;
+            handle_search(target.effective_root.clone(), terms, fuzzy)
+                .map(|p| attach_target(p, &target))
+        }
+        Commands::Links { action } => match action {
+            LinksAction::Show { .. } | LinksAction::List { .. } => {
+                let target = resolve_command_target(&root, external.clone())?;
+                handle_links(target.effective_root.clone(), action).map(|p| attach_target(p, &target))
+            }
+            _ => {
+                ensure_external_disabled("links mutating actions", external.as_deref())?;
+                handle_links(root, action)
+            }
+        },
+        Commands::Sum { top_links } => {
+            let target = resolve_command_target(&root, external.clone())?;
+            handle_sum(target.effective_root.clone(), top_links).map(|p| attach_target(p, &target))
+        }
         Commands::List {
             language,
             component_type,
             all,
             dead,
             fault,
-        } => handle_list(root, language, component_type, all, dead, fault),
-        Commands::Show { component_id } => handle_show(root, component_id),
+        } => {
+            let target = resolve_command_target(&root, external.clone())?;
+            handle_list(
+                target.effective_root.clone(),
+                language,
+                component_type,
+                all,
+                dead,
+                fault,
+            )
+            .map(|p| attach_target(p, &target))
+        }
+        Commands::Show { component_id } => {
+            let target = resolve_command_target(&root, external.clone())?;
+            handle_show(target.effective_root.clone(), component_id).map(|p| attach_target(p, &target))
+        }
         Commands::Deps {
             component_id,
             depth,
-        } => handle_deps(root, component_id, depth),
-        Commands::Annotate { action } => handle_annotate(root, action),
-        Commands::Config { action } => handle_config(root, action),
+        } => {
+            let target = resolve_command_target(&root, external.clone())?;
+            handle_deps(target.effective_root.clone(), component_id, depth)
+                .map(|p| attach_target(p, &target))
+        }
+        Commands::Annotate { action } => {
+            let target = resolve_command_target(&root, external.clone())?;
+            handle_annotate(target, action)
+        }
+        Commands::Config { action, global } => {
+            ensure_external_disabled("config", external.as_deref())?;
+            handle_config(root, action, global)
+        }
+        Commands::Registry { action } => {
+            ensure_external_disabled("registry", external.as_deref())?;
+            handle_registry(root.clone(), action)
+        }
     };
 
     match result {
@@ -102,6 +154,74 @@ pub fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct CommandTarget {
+    cwd: PathBuf,
+    effective_root: PathBuf,
+    project_id: Option<String>,
+}
+
+impl CommandTarget {
+    fn local(cwd: PathBuf) -> Self {
+        Self {
+            cwd: cwd.clone(),
+            effective_root: cwd,
+            project_id: None,
+        }
+    }
+
+    fn is_foreign(&self) -> bool {
+        canonical_for_compare(&self.cwd) != canonical_for_compare(&self.effective_root)
+    }
+}
+
+fn canonical_for_compare(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn ensure_external_disabled(scope: &str, external: Option<&str>) -> Result<()> {
+    if let Some(project_id) = external {
+        bail!(
+            "`--external {}` is not supported for {}; run this command from the target repository",
+            project_id,
+            scope
+        );
+    }
+    Ok(())
+}
+
+fn resolve_command_target(cwd: &Path, external: Option<String>) -> Result<CommandTarget> {
+    if let Some(project_id) = external {
+        let effective_root = projects_registry::resolve_project_root(&project_id)?;
+        Ok(CommandTarget {
+            cwd: cwd.to_path_buf(),
+            effective_root,
+            project_id: Some(project_id),
+        })
+    } else {
+        Ok(CommandTarget::local(cwd.to_path_buf()))
+    }
+}
+
+fn attach_target(mut payload: Value, target: &CommandTarget) -> Value {
+    let target_json = if let Some(project_id) = &target.project_id {
+        json!({
+            "mode": "external",
+            "project_id": project_id,
+            "root": target.effective_root.display().to_string(),
+        })
+    } else {
+        json!({
+            "mode": "local",
+            "root": target.effective_root.display().to_string(),
+        })
+    };
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("target".to_string(), target_json);
+    }
+    payload
 }
 
 fn exit_error(message: &str, json_mode: bool) -> ! {
@@ -135,11 +255,20 @@ fn exit_error(message: &str, json_mode: bool) -> ! {
   lime deps fn-61bcc6dabec3f308  Show dependency matrix
   lime links show auth           Components matching link path auth (merged store + annotations)
   lime links list                All link paths; lime links add <id> <path> to assign
+  lime registry add              Register current directory in ~/.lime router
+  lime registry add ../tokio     Register another repo root
+  lime show --external tokio fn-abc123
   lime sum                       Bounded overview (counts, links, staleness)"#
 )]
 struct Cli {
     #[arg(long, global = true, help = "Output raw JSON for scripts and agents")]
     json: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Route supported read commands to a registered external project id"
+    )]
+    external: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -322,16 +451,59 @@ enum Commands {
 
     /// Inspect and update Lime configuration.
     ///
-    /// This reads and writes `.lime/lime.json` in the current repository.
-    /// Use `lime config show` to view the full config, and the other
-    /// subcommands to update specific sections without losing defaults.
+    /// By default this reads/writes the **project** config (`.lime/lime.json`).
+    /// Pass `--global` to operate on the **global** config instead
+    /// (`~/.config/lime/lime.json` on Linux/macOS, `%APPDATA%\lime\lime.json`
+    /// on Windows).
+    ///
+    /// The global config is used as a template when initialising new project
+    /// configs, so preferences set globally carry over automatically.
     ///
     /// Examples:
     ///   "lime config show"
+    ///   "lime config --global show"
+    ///   "lime config --global diagnostics --enabled true"
     ///   "lime config death-seeds --seed-file src/main.rs --seed-name main --seed-type fn"
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+        /// Operate on the global config (~/.config/lime/lime.json) instead of the project config.
+        #[arg(long, global = true)]
+        global: bool,
+    },
+    /// Global router: register repository roots in `~/.lime/projects.json` (no `.lime` init required).
+    ///
+    /// Maps `projectID` → absolute root so `lime --external <projectID> …` can read (and safely annotate-add)
+    /// another checkout without copying indexes.
+    ///
+    /// Examples:
+    ///   "lime registry list"
+    ///   "lime registry add"                    # current directory
+    ///   "lime registry add ../tokio"
+    ///   "lime registry add --id ruststd C:/dev/rust/library"
+    ///   "lime registry remove ruststd"
+    Registry {
+        #[command(subcommand)]
+        action: RegistryAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RegistryAction {
+    /// List all registered repository roots.
+    List,
+    /// Register a repository root (defaults to current directory if path omitted).
+    Add {
+        /// Optional explicit project id. Defaults to folder basename.
+        #[arg(long)]
+        id: Option<String>,
+        /// Repository root to register (omit = current working directory).
+        path: Option<PathBuf>,
+    },
+    /// Remove a registered project id from the router file.
+    Remove {
+        /// Project id to remove.
+        project_id: String,
     },
 }
 
@@ -515,6 +687,61 @@ enum ConfigAction {
         #[arg(long = "use-git-for-empty-sync")]
         use_git_for_empty_sync: Option<bool>,
     },
+}
+
+fn handle_registry(cwd: PathBuf, action: RegistryAction) -> Result<Value> {
+    match action {
+        RegistryAction::List => {
+            let registry = projects_registry::load_registry()?;
+            let path = projects_registry::registry_path()?;
+            let projects: Vec<Value> = registry
+                .projects
+                .iter()
+                .map(|(project_id, reg)| {
+                    json!({
+                        "project_id": project_id,
+                        "root": reg.root,
+                        "updated_at": reg.updated_at,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "ok": true,
+                "command": "registry",
+                "action": "list",
+                "registry_path": path.display().to_string(),
+                "count": projects.len(),
+                "projects": projects,
+            }))
+        }
+        RegistryAction::Add { id, path } => {
+            let path = path.unwrap_or(cwd);
+            let (project_id, canonical_root) =
+                projects_registry::register_project(id.as_deref(), &path)?;
+            let registry_path = projects_registry::registry_path()?;
+            Ok(json!({
+                "ok": true,
+                "command": "registry",
+                "action": "add",
+                "registry_path": registry_path.display().to_string(),
+                "project_id": project_id,
+                "root": canonical_root.display().to_string(),
+                "updated": true,
+            }))
+        }
+        RegistryAction::Remove { project_id } => {
+            let removed = projects_registry::unregister_project(&project_id)?;
+            let registry_path = projects_registry::registry_path()?;
+            Ok(json!({
+                "ok": true,
+                "command": "registry",
+                "action": "remove",
+                "registry_path": registry_path.display().to_string(),
+                "project_id": project_id,
+                "removed": removed,
+            }))
+        }
+    }
 }
 
 fn handle_sum(root: PathBuf, top_links: usize) -> Result<Value> {
@@ -867,29 +1094,61 @@ fn handle_remove(root: PathBuf, filename: String) -> Result<Value> {
     }))
 }
 
-fn handle_config(root: PathBuf, action: ConfigAction) -> Result<Value> {
+fn handle_config(root: PathBuf, action: ConfigAction, global: bool) -> Result<Value> {
+    // Helper: load either global or project config.
+    let load = |root: &std::path::Path| -> Result<LimeConfig> {
+        if global {
+            LimeConfig::load_global()
+        } else {
+            LimeConfig::load_or_create(root)
+        }
+    };
+    // Helper: save either global or project config; returns the path string for output.
+    let save = |cfg: &LimeConfig, root: &std::path::Path| -> Result<String> {
+        if global {
+            cfg.save_global()?;
+            Ok(LimeConfig::global_config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(unknown)".to_string()))
+        } else {
+            cfg.save(root)?;
+            Ok(LimeConfig::config_path(root).display().to_string())
+        }
+    };
+
     match action {
         ConfigAction::Show => {
-            let config = LimeConfig::load_or_create(&root)?;
+            let config = load(&root)?;
+            let config_path = if global {
+                LimeConfig::global_config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string())
+            } else {
+                LimeConfig::config_path(&root).display().to_string()
+            };
             Ok(json!({
                 "ok": true,
                 "command": "config_show",
+                "global": global,
+                "config_path": config_path,
                 "config": config,
             }))
         }
         ConfigAction::Diagnostics { enabled, timeout } => {
-            let mut config = LimeConfig::load_or_create(&root)?;
+            let mut config = load(&root)?;
             if let Some(value) = enabled {
                 config.diagnostics.enabled = value;
             }
             if let Some(value) = timeout {
                 config.diagnostics.timeout_secs = value;
             }
-            config.save(&root)?;
+            let config_path = save(&config, &root)?;
             let diag = config.diagnostics.clone();
             Ok(json!({
                 "ok": true,
                 "command": "config_diagnostics",
+                "global": global,
+                "config_path": config_path,
                 "diagnostics": diag,
             }))
         }
@@ -901,7 +1160,7 @@ fn handle_config(root: PathBuf, action: ConfigAction) -> Result<Value> {
             clear_seed_names,
             clear_seed_types,
         } => {
-            let mut config = LimeConfig::load_or_create(&root)?;
+            let mut config = load(&root)?;
 
             if clear_seed_files {
                 config.death_seeds.seed_files.clear();
@@ -935,25 +1194,36 @@ fn handle_config(root: PathBuf, action: ConfigAction) -> Result<Value> {
                 }
             }
 
-            config.save(&root)?;
+            let config_path = save(&config, &root)?;
             let seeds = config.death_seeds.clone();
 
             Ok(json!({
                 "ok": true,
                 "command": "config_death_seeds",
+                "global": global,
+                "config_path": config_path,
                 "death_seeds": seeds,
             }))
         }
         ConfigAction::Index { pretty } => {
-            let mut config = LimeConfig::load_or_create(&root)?;
+            let mut config = load(&root)?;
             let updated = pretty.is_some();
             if let Some(value) = pretty {
                 config.index_pretty = value;
-                config.save(&root)?;
+                let _ = save(&config, &root)?;
             }
+            let config_path = if global {
+                LimeConfig::global_config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string())
+            } else {
+                LimeConfig::config_path(&root).display().to_string()
+            };
             Ok(json!({
                 "ok": true,
                 "command": "config_index",
+                "global": global,
+                "config_path": config_path,
                 "index_pretty": config.index_pretty,
                 "updated": updated,
             }))
@@ -961,15 +1231,24 @@ fn handle_config(root: PathBuf, action: ConfigAction) -> Result<Value> {
         ConfigAction::GitPartialSync {
             use_git_for_empty_sync,
         } => {
-            let mut config = LimeConfig::load_or_create(&root)?;
+            let mut config = load(&root)?;
             let updated = use_git_for_empty_sync.is_some();
             if let Some(value) = use_git_for_empty_sync {
                 config.git_partial_sync.empty_sync_uses_git = value;
-                config.save(&root)?;
+                let _ = save(&config, &root)?;
             }
+            let config_path = if global {
+                LimeConfig::global_config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string())
+            } else {
+                LimeConfig::config_path(&root).display().to_string()
+            };
             Ok(json!({
                 "ok": true,
                 "command": "config_git_partial_sync",
+                "global": global,
+                "config_path": config_path,
                 "empty_sync_uses_git": config.git_partial_sync.empty_sync_uses_git,
                 "updated": updated,
             }))
@@ -1842,7 +2121,8 @@ fn handle_deps(root: PathBuf, component_id: String, depth: Option<usize>) -> Res
     }))
 }
 
-fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
+fn handle_annotate(target: CommandTarget, action: AnnotateAction) -> Result<Value> {
+    let root = target.effective_root.clone();
     let config = LimeConfig::load_or_create(&root)?;
     let timer = std::time::Instant::now();
     let index = storage::load_index_or_empty(&root, &config)?;
@@ -1889,7 +2169,7 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
                 if p.is_absolute() {
                     p.clone()
                 } else {
-                    root.join(p)
+                    target.effective_root.join(p)
                 }
             });
 
@@ -1925,15 +2205,17 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
             };
 
             annotations::save_annotation(&root, &annotation)?;
-            for link in &annotation.links {
-                if links::validate_link_path(link).is_ok() {
-                    let _ = links::add_membership(&root, &component_id, link);
+            if !target.is_foreign() {
+                for link in &annotation.links {
+                    if links::validate_link_path(link).is_ok() {
+                        let _ = links::add_membership(&root, &component_id, link);
+                    }
                 }
+                persist_token_index(&root, &index);
             }
-            persist_token_index(&root, &index);
             let elapsed = timer.elapsed();
 
-            Ok(json!({
+            Ok(attach_target(json!({
                 "ok": true,
                 "command": "annotate",
                 "action": "add",
@@ -1946,8 +2228,9 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
                     "links": annotation.links,
                     "created_at": annotation.created_at,
                     "updated_at": annotation.updated_at
-                }
-            }))
+                },
+                "external_write_policy": if target.is_foreign() { "annotation_only" } else { "local_full" }
+            }), &target))
         }
         AnnotateAction::Show { component_id } => {
             let component = index
@@ -1960,7 +2243,7 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
                 .ok_or_else(|| anyhow!("no annotation for component: {component_id}"))?;
             let elapsed = timer.elapsed();
 
-            Ok(json!({
+            Ok(attach_target(json!({
                 "ok": true,
                 "command": "annotate",
                 "action": "show",
@@ -1974,7 +2257,7 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
                     "created_at": annotation.created_at,
                     "updated_at": annotation.updated_at
                 }
-            }))
+            }), &target))
         }
         AnnotateAction::List {
             language,
@@ -2013,30 +2296,35 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
 
             let elapsed = timer.elapsed();
 
-            Ok(json!({
+            Ok(attach_target(json!({
                 "ok": true,
                 "command": "annotate",
                 "action": "list",
                 "elapsed_secs": elapsed.as_secs_f64(),
                 "count": filtered.len(),
                 "results": filtered
-            }))
+            }), &target))
         }
         AnnotateAction::Remove { component_id } => {
+            if target.is_foreign() {
+                bail!(
+                    "annotate remove is not allowed with --external for foreign repositories (annotation add is permitted)"
+                );
+            }
             let removed = annotations::remove_annotation(&root, &component_id)?;
             if removed {
                 persist_token_index(&root, &index);
             }
             let elapsed = timer.elapsed();
 
-            Ok(json!({
+            Ok(attach_target(json!({
                 "ok": true,
                 "command": "annotate",
                 "action": "remove",
                 "elapsed_secs": elapsed.as_secs_f64(),
                 "component_id": component_id,
                 "removed": removed
-            }))
+            }), &target))
         }
     }
 }
@@ -2210,5 +2498,91 @@ fn truncate_preview(content: &str, max_len: usize) -> String {
         single_line.to_string()
     } else {
         format!("{}...", &single_line[..max_len.saturating_sub(3)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn attach_target_marks_external_mode() {
+        let payload = json!({"ok": true, "command": "show"});
+        let target = CommandTarget {
+            cwd: PathBuf::from("C:/repo-a"),
+            effective_root: PathBuf::from("C:/repo-b"),
+            project_id: Some("repo-b".to_string()),
+        };
+        let result = attach_target(payload, &target);
+        assert_eq!(
+            result.get("target").and_then(|t| t.get("mode")).and_then(Value::as_str),
+            Some("external")
+        );
+        assert_eq!(
+            result
+                .get("target")
+                .and_then(|t| t.get("project_id"))
+                .and_then(Value::as_str),
+            Some("repo-b")
+        );
+    }
+
+    #[test]
+    fn reject_external_for_forbidden_command() {
+        let err = ensure_external_disabled("sync", Some("demo")).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("not supported"));
+    }
+
+    #[test]
+    fn show_payload_can_be_tagged_external_target() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lime-external-show-{suffix}"));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src").join("demo.rs"),
+            "pub fn external_demo() -> i32 { 42 }\n",
+        )
+        .unwrap();
+
+        let config = LimeConfig::load_or_create(&root).unwrap();
+        let index = index::rebuild_index(&root, &config).unwrap();
+        storage::save_index(&root, &config, &index).unwrap();
+        let component_id = index
+            .components
+            .iter()
+            .find(|c| c.name == "external_demo")
+            .map(|c| c.id.clone())
+            .expect("component id must exist");
+
+        let payload = handle_show(root.clone(), component_id).unwrap();
+        let tagged = attach_target(
+            payload,
+            &CommandTarget {
+                cwd: root.join("other-cwd"),
+                effective_root: root.clone(),
+                project_id: Some("demo".to_string()),
+            },
+        );
+        assert_eq!(
+            tagged
+                .get("target")
+                .and_then(|t| t.get("mode"))
+                .and_then(Value::as_str),
+            Some("external")
+        );
+        assert_eq!(
+            tagged
+                .get("component")
+                .and_then(|c| c.get("name"))
+                .and_then(Value::as_str),
+            Some("external_demo")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -8,6 +8,9 @@ the component you requested; with the line numbers, of course.
 It also allows you to view the dependencies (at various "depths" or chain-related dependent components) of a specific component to see what's used by, or uses, the component you've requested; run "lime deps {type}-{hashID}"
 to see the "dependency matrix". 
 
+Lime can also reference components from other indexed repositories on your machine: add them to the global router (`lime registry add` for the current folder, or `lime registry add <path>`) and query with `--external <projectID>`, for example
+`lime show --external tokio fn-...`. This routes reads to the target repo's existing `.lime` data (no duplicated global index).
+
 Lime additionally has a component death detection algorithm, which requires a component's dependencies and/or line-by-line validation to satisfy specific "inverse" requirements, which ensure components aren't marked as "dead"
 while they're still alive. You can see "[dead]" flagged components in "lime list {lang} -a", or filter by "dead" using the "--dead" flag. 
 

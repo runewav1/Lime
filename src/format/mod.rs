@@ -117,6 +117,7 @@ pub fn render(payload: &Value) -> String {
         "deps" => render_deps(payload, &s),
         "annotate" => render_annotate(payload, &s),
         "show" => render_show(payload, &s),
+        "registry" => render_registry(payload, &s),
         _ => serde_json::to_string_pretty(payload).unwrap_or_default(),
     }
 }
@@ -1430,6 +1431,48 @@ fn render_annotate_remove(v: &Value, s: &Style) -> String {
         let _ = writeln!(out, "\n{}", s.dim(&format_duration(elapsed)));
     }
 
+    out
+}
+
+fn render_registry(v: &Value, s: &Style) -> String {
+    let action = str_val(v, "action");
+    let mut out = String::new();
+    match action.as_str() {
+        "list" => {
+            let count = num_val(v, "count");
+            let _ = writeln!(
+                out,
+                "{} {} registered root{}",
+                s.bold("registry:"),
+                count,
+                plural(count)
+            );
+            if let Some(items) = v.get("projects").and_then(Value::as_array) {
+                for item in items {
+                    let pid = item.get("project_id").and_then(Value::as_str).unwrap_or("?");
+                    let root = item.get("root").and_then(Value::as_str).unwrap_or("?");
+                    let _ = writeln!(out, "  {} {}", s.cyan(pid), s.dim(root));
+                }
+            }
+        }
+        "add" => {
+            let pid = str_val(v, "project_id");
+            let root = str_val(v, "root");
+            let _ = writeln!(out, "{} {} -> {}", s.bold_green("registered"), s.cyan(&pid), root);
+        }
+        "remove" => {
+            let pid = str_val(v, "project_id");
+            let removed = v.get("removed").and_then(Value::as_bool).unwrap_or(false);
+            if removed {
+                let _ = writeln!(out, "{} {}", s.red("removed"), s.cyan(&pid));
+            } else {
+                let _ = writeln!(out, "{} {}", s.yellow("not found:"), s.cyan(&pid));
+            }
+        }
+        _ => {
+            out = serde_json::to_string_pretty(v).unwrap_or_default();
+        }
+    }
     out
 }
 

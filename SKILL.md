@@ -155,7 +155,49 @@ lime --json links compact                 # drop duplicate link lines from annot
 
 Bounded overview; **`links_top`** counts components per path using the **same merged** membership as `lime links show` / search tokens (not annotations alone).
 
-### config {show|diagnostics|death-seeds|index|git-partial-sync}
+### registry {list|add|remove}
+
+Global router file: `~/.lime/projects.json` (small JSON map only; indexes stay in each repo’s `.lime/`).
+
+No `.lime` init is required to **register** a path: `registry add` only records the root so `--external` can route reads (and safe `annotate add`) there.
+
+```bash
+lime --json registry list
+lime --json registry add                         # register current working directory
+lime --json registry add ../some-repo            # id defaults to folder basename
+lime --json registry add --id tokio C:/dev/tokio
+lime --json registry remove tokio
+```
+
+**JSON:** `{ok, command:"registry", action, registry_path, ...}` (list includes `projects: [...]` entries)
+
+### Cross-repository `--external <projectID>`
+
+Route supported commands to another registered repository without copying indexes. Register roots first (`lime registry add` from that tree, or `lime registry add <path>`).
+
+```bash
+lime --json show --external tokio fn-abc123
+lime --json search --external tokio reactor
+lime --json links show --external tokio runtime
+lime --json annotate add --external tokio fn-abc123 -m "used by app X"
+```
+
+Responses for routed commands include:
+
+```json
+"target": { "mode": "external", "project_id": "tokio", "root": "..." }
+```
+
+Safety policy (foreign repository target):
+
+| Command area | `--external` |
+|---|---|
+| `show`, `deps`, `search`, `list`, `sum`, `links show/list`, `annotate show/list` | Allowed (read-only) |
+| `annotate add` | Allowed (**annotation markdown only**) |
+| `annotate remove` | Blocked |
+| `sync`, `add`, `remove`, `links add/remove/compact`, `config`, `registry` | Blocked |
+
+### config {show|diagnostics|death-seeds|index|git-partial-sync} [--global]
 
 ```bash
 lime --json config show
@@ -165,9 +207,31 @@ lime --json config death-seeds --clear-seed-files   # clear before adding
 lime --json config index --pretty false              # compact JSON writes
 lime --json config git-partial-sync                 # show empty_sync_uses_git
 lime --json config git-partial-sync --use-git-for-empty-sync true
+
+# --global flag operates on the global config instead of the project config:
+lime --json config --global show
+lime --json config --global diagnostics --enabled true
+lime --json config --global git-partial-sync --use-git-for-empty-sync true
 ```
 
 death-seeds flags: `--seed-file <pattern>`, `--seed-name <name>`, `--seed-type <type>`, `--clear-seed-files`, `--clear-seed-names`, `--clear-seed-types`.
+
+**JSON:** adds `"global": bool` and `"config_path": "<abs path>"` to all config responses.
+
+## Global Config (`~/.config/lime/lime.json`)
+
+Lime supports a **global config** that lives outside any repository:
+
+| Platform | Path |
+|----------|------|
+| Linux / macOS | `~/.config/lime/lime.json` |
+| Windows | `%APPDATA%\lime\lime.json` |
+
+**Purpose:** When `lime sync` (or any command that triggers `load_or_create`) initialises a **new** project config (`.lime/lime.json` not yet present), the global config is used as the starting template instead of hard-coded defaults. Preferences set once globally carry over to every new repository automatically.
+
+`index_storage` is always reset to `.lime/index.json` regardless of what the global config says, so one project's custom index path never bleeds into another.
+
+Use `lime config --global <subcommand>` to manage global preferences. The file is created automatically on first write.
 
 ## Config (`.lime/lime.json`)
 
