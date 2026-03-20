@@ -26,6 +26,9 @@ pub struct Annotation {
     pub content: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Cross-component pipeline / topic labels (queried via `lime link <name>`).
+    #[serde(default)]
+    pub links: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -49,6 +52,8 @@ struct AnnotationFrontmatter {
     language: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    links: Vec<String>,
     created_at: String,
     updated_at: String,
 }
@@ -86,6 +91,7 @@ pub fn save_annotation(root: &Path, annotation: &Annotation) -> Result<()> {
         file: annotation.file.clone(),
         language: annotation.language.clone(),
         tags: annotation.tags.clone(),
+        links: annotation.links.clone(),
         created_at,
         updated_at,
     };
@@ -233,6 +239,7 @@ fn parse_annotation_file(raw: &str) -> Result<Annotation> {
         language: frontmatter.language,
         content,
         tags: frontmatter.tags,
+        links: frontmatter.links,
         created_at: frontmatter.created_at,
         updated_at: frontmatter.updated_at,
     })
@@ -417,6 +424,7 @@ mod tests {
             language: Some("rust".to_string()),
             content: "x".to_string(),
             tags: vec![],
+            links: vec![],
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -438,11 +446,31 @@ mod tests {
             language: None,
             content: "y".to_string(),
             tags: vec![],
+            links: vec![],
             created_at: String::new(),
             updated_at: String::new(),
         };
 
         let c = resolve_component_for_annotation(&idx, &ann).expect("resolves");
         assert_eq!(c.id, "fn-only");
+    }
+
+    #[test]
+    fn parse_annotation_with_links_in_frontmatter() {
+        let raw = r#"---
+hash_id = "fn-a"
+component_type = "fn"
+component_name = "foo"
+tags = []
+links = ["auth", "billing"]
+created_at = "2026-01-01T00:00:00Z"
+updated_at = "2026-01-01T00:00:00Z"
+---
+
+Note body
+"#;
+        let a = parse_annotation_file(raw).expect("parse");
+        assert_eq!(a.links, vec!["auth".to_string(), "billing".to_string()]);
+        assert_eq!(a.content.trim(), "Note body");
     }
 }

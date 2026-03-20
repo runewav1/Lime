@@ -505,6 +505,12 @@ pub fn build_token_index(index: &IndexData, annotations: &[Annotation]) -> Searc
                 ann_tokens.push(tag_lower);
             }
         }
+        for link in &annotation.links {
+            let link_lower = link.to_ascii_lowercase();
+            if !ann_tokens.contains(&link_lower) {
+                ann_tokens.push(link_lower);
+            }
+        }
 
         add_tokens(
             &component.id,
@@ -975,6 +981,7 @@ mod tests {
             language: None,
             content: "Searchable **annotation** details".to_string(),
             tags: Vec::new(),
+            links: Vec::new(),
             created_at: "2026-03-17T00:00:00Z".to_string(),
             updated_at: "2026-03-17T00:00:00Z".to_string(),
         }];
@@ -1018,6 +1025,7 @@ mod tests {
             language: None,
             content: "OAuth callback handling details".to_string(),
             tags: Vec::new(),
+            links: Vec::new(),
             created_at: "2026-03-17T00:00:00Z".to_string(),
             updated_at: "2026-03-17T00:00:00Z".to_string(),
         }];
@@ -1059,6 +1067,7 @@ mod tests {
             language: None,
             content: "Parse behavior overview".to_string(),
             tags: Vec::new(),
+            links: Vec::new(),
             created_at: "2026-03-17T00:00:00Z".to_string(),
             updated_at: "2026-03-17T00:00:00Z".to_string(),
         }];

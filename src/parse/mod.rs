@@ -172,19 +172,26 @@ static GO_VAR_RE: LazyLock<Regex> =
 /// `struct` / `class` / `enum` / `protocol` / `actor` with optional attributes and access control.
 static SWIFT_TYPE_DECL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)^\s*(?:@(?:[A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?\s+)*(?:open|public|internal|fileprivate|private|package)?\s*(?:final\s+)?(struct|class|enum|protocol|actor)\s+([A-Za-z_][A-Za-z0-9_]*)",
+        r"(?m)^\s*(?:@(?:[A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?\s+)*(?:open|public|internal|fileprivate|private|package)?\s*(?:(?:indirect|final)\s+)*(struct|class|enum|protocol|actor)\s+([A-Za-z_][A-Za-z0-9_]*)",
     )
     .unwrap()
 });
 static SWIFT_EXTENSION_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)^\s*(?:open|public|internal|fileprivate|private|package)?\s*extension\s+([A-Za-z_][A-Za-z0-9_.]*)",
+        r"(?m)^\s*(?:@(?:[A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?\s+)*(?:open|public|internal|fileprivate|private|package)?\s*extension\s+([A-Za-z_][A-Za-z0-9_.]*)",
     )
     .unwrap()
 });
+/// Identifier functions plus common Swift operators (`==`, `+=`, `..<`, etc.).
 static SWIFT_FUNC_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)^\s*(?:@(?:[A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?\s+)*(?:open|public|internal|fileprivate|private|package)?\s*(?:static\s+|class\s+|mutating\s+|nonisolated\s+|override\s+)*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        r"(?m)^\s*(?:@(?:[A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?\s+)*(?:open|public|internal|fileprivate|private|package)?\s*(?:static\s+|class\s+|mutating\s+|nonisolated\s+|override\s+)*func\s+((?:[A-Za-z_][A-Za-z0-9_]*)|==|!=|===|!==|<=|>=|\.\.\.|\.\.<|&&|\|\||\+\+|--|[-+*/%=<>!&|^~]+)\s*\(",
+    )
+    .unwrap()
+});
+static SWIFT_SUBSCRIPT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^\s*(?:@(?:[A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?\s+)*(?:open|public|internal|fileprivate|private|package)?\s*(?:static\s+|class\s+)?subscript\s*\(",
     )
     .unwrap()
 });
@@ -202,13 +209,13 @@ static SWIFT_DEINIT_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SWIFT_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)^\s*import\s+(?:typealias\s+|struct\s+|enum\s+|class\s+|protocol\s+)?([A-Za-z_][A-Za-z0-9_.]*)",
+        r"(?m)^\s*(?:@(?:[A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?\s+)*import\s+(?:typealias\s+|struct\s+|enum\s+|class\s+|protocol\s+)?([A-Za-z_][A-Za-z0-9_.]*)",
     )
     .unwrap()
 });
 static SWIFT_TYPEALIAS_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)^\s*(?:open|public|internal|fileprivate|private|package)?\s*typealias\s+([A-Za-z_][A-Za-z0-9_]*)",
+        r"(?m)^\s*(?:@(?:[A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?\s+)*(?:open|public|internal|fileprivate|private|package)?\s*typealias\s+([A-Za-z_][A-Za-z0-9_]*)",
     )
     .unwrap()
 });
@@ -356,6 +363,12 @@ fn parse_swift(content: &str, out: &mut Vec<ParsedComponent>) {
     collect_single_group(content, &SWIFT_IMPORT_RE, "import", out);
     collect_single_group(content, &SWIFT_TYPEALIAS_RE, "typealias", out);
     collect_single_group(content, &SWIFT_FUNC_RE, "func", out);
+
+    for captures in SWIFT_SUBSCRIPT_RE.captures_iter(content) {
+        if let Some(matched) = captures.get(0) {
+            out.push(ParsedComponent::new("subscript", "subscript", matched.start()));
+        }
+    }
 
     for captures in SWIFT_INIT_RE.captures_iter(content) {
         if let Some(matched) = captures.get(0) {
@@ -1089,6 +1102,65 @@ struct Box {
             .collect();
         assert!(funcs.contains(&"describe"), "expected func describe, got: {funcs:?}");
         assert!(funcs.contains(&"make"), "expected static func make, got: {funcs:?}");
+    }
+
+    #[test]
+    fn swift_edge_import_indirect_extension_operators_subscript() {
+        let src = r#"
+@testable import XCTest
+@_exported import Foundation
+
+indirect enum Expr {
+    case leaf(Expr)
+}
+
+@objc extension NSObject {
+    subscript(key: String) -> Any? { nil }
+}
+
+struct Pair {
+    static func == (lhs: Pair, rhs: Pair) -> Bool { true }
+    static func += (left: inout Pair, right: Pair) {}
+    static func ..< (lhs: Pair, rhs: Pair) -> Bool { true }
+    func + (other: Pair) -> Pair { self }
+}
+"#;
+        let components = parse_components("swift", src);
+        let types: Vec<(&str, &str)> = components
+            .iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+
+        assert!(
+            types.contains(&("import", "XCTest")),
+            "expected @testable import XCTest, got: {types:?}"
+        );
+        assert!(
+            types.contains(&("import", "Foundation")),
+            "expected @_exported import Foundation, got: {types:?}"
+        );
+        assert!(
+            types.contains(&("enum", "Expr")),
+            "expected indirect enum Expr, got: {types:?}"
+        );
+        assert!(
+            types.contains(&("extension", "NSObject")),
+            "expected @objc extension NSObject, got: {types:?}"
+        );
+        assert!(
+            types.iter().filter(|(t, _)| *t == "subscript").count() >= 1,
+            "expected subscript, got: {types:?}"
+        );
+
+        let funcs: Vec<&str> = components
+            .iter()
+            .filter(|c| c.component_type == "func")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(funcs.contains(&"=="), "expected operator ==, got: {funcs:?}");
+        assert!(funcs.contains(&"+="), "expected operator +=, got: {funcs:?}");
+        assert!(funcs.contains(&"..<"), "expected operator ..<, got: {funcs:?}");
+        assert!(funcs.contains(&"+"), "expected operator +, got: {funcs:?}");
     }
 
     // ---- Zig parsing ----

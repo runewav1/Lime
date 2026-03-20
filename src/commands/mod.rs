@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     env,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -65,6 +66,7 @@ pub fn run() -> Result<()> {
             terms,
             fuzzy,
         } => handle_search(root, terms, fuzzy),
+        Commands::Link { label, notes } => handle_link(root, label, notes),
         Commands::List {
             language,
             component_type,
@@ -125,7 +127,8 @@ fn exit_error(message: &str, json_mode: bool) -> ! {
   lime search rust fn run        Search Rust functions
   lime list rust                 Show Rust component counts
   lime list rust --all           List all Rust components
-  lime deps fn-61bcc6dabec3f308  Show dependency matrix"#
+  lime deps fn-61bcc6dabec3f308  Show dependency matrix
+  lime link auth                 Components annotated with link \"auth\""#
 )]
 struct Cli {
     #[arg(long, global = true, help = "Output raw JSON for scripts and agents")]
@@ -197,6 +200,21 @@ enum Commands {
         /// Enable fuzzy matching with token-based and annotation search.
         #[arg(long)]
         fuzzy: bool,
+    },
+    /// List components that share an annotation link label (topic / pipeline).
+    ///
+    /// Uses the `links` field on annotations (`lime annotate add --link <name>`).
+    /// Matching is case-insensitive. Add `--notes` to include full annotation bodies.
+    ///
+    /// Examples:
+    ///   "lime link auth"
+    ///   "lime link auth --notes"
+    Link {
+        /// Link label to match (e.g. `auth`).
+        label: String,
+        /// Include full annotation markdown in each result.
+        #[arg(long)]
+        notes: bool,
     },
     /// List indexed languages or components.
     ///
@@ -296,15 +314,23 @@ enum AnnotateAction {
     /// Examples:
     ///   "lime annotate add fn-abc123 -m 'Entry point for auth flow'"
     ///   "lime annotate add struct-def456 -m 'Primary data model for users'"
+    ///   "lime annotate add fn-x --file docs/fn-x.md --link auth"
+    ///   "lime annotate add fn-x --link auth"   (updates links only if annotation exists)
     Add {
         /// Component ID (from `lime search` or `lime list --all`).
         component_id: String,
-        /// Annotation content (markdown).
-        #[arg(short = 'm', long = "message")]
-        message: String,
+        /// Inline markdown body (cannot be used with `--file`).
+        #[arg(short = 'm', long = "message", conflicts_with = "body_file")]
+        message: Option<String>,
+        /// Read annotation body from this file (repo-relative or absolute; cannot be used with `-m`).
+        #[arg(long = "file", conflicts_with = "message")]
+        body_file: Option<PathBuf>,
         /// Tags for the annotation (e.g. keep, public_api, entrypoint).
         #[arg(short = 't', long = "tag")]
         tags: Vec<String>,
+        /// Link labels: group components for `lime link <name>` (topic / pipeline).
+        #[arg(short = 'l', long = "link")]
+        links: Vec<String>,
     },
     /// Display an annotation for a component.
     ///
@@ -897,6 +923,101 @@ fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value
     }))
 }
 
+fn annotation_matches_link(annotation: &annotations::Annotation, label: &str) -> bool {
+    let q = label.trim();
+    if q.is_empty() {
+        return false;
+    }
+    annotation
+        .links
+        .iter()
+        .any(|l| l.trim().eq_ignore_ascii_case(q))
+}
+
+fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
+    let config = LimeConfig::load_or_create(&root)?;
+    let timer = std::time::Instant::now();
+    let index = storage::load_index_or_empty(&root, &config)?;
+    let index_staleness =
+        serde_json::to_value(git_staleness::evaluate(&root, &index)).unwrap_or(json!({}));
+
+    let q = label.trim();
+    if q.is_empty() {
+        bail!("link label must not be empty");
+    }
+
+    let all_annotations = annotations::list_annotations(&root)?;
+    let mut results: Vec<Value> = Vec::new();
+
+    for ann in &all_annotations {
+        if !annotation_matches_link(ann, q) {
+            continue;
+        }
+        let Some(comp) = annotations::resolve_component_for_annotation(&index, ann) else {
+            continue;
+        };
+
+        let preview = truncate_preview(&ann.content, 120);
+        let row = if notes {
+            json!({
+                "component": comp,
+                "links": ann.links,
+                "tags": ann.tags,
+                "annotation": {
+                    "hash_id": ann.hash_id,
+                    "content": ann.content,
+                    "tags": ann.tags,
+                    "links": ann.links,
+                    "created_at": ann.created_at,
+                    "updated_at": ann.updated_at,
+                }
+            })
+        } else {
+            json!({
+                "component": comp,
+                "links": ann.links,
+                "tags": ann.tags,
+                "annotation_preview": preview,
+            })
+        };
+        results.push(row);
+    }
+
+    results.sort_by(|a, b| {
+        let ca = a.get("component").and_then(Value::as_object);
+        let cb = b.get("component").and_then(Value::as_object);
+        let fa = ca
+            .and_then(|o| o.get("file"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let fb = cb
+            .and_then(|o| o.get("file"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let la = ca
+            .and_then(|o| o.get("start_line"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let lb = cb
+            .and_then(|o| o.get("start_line"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        (fa, la).cmp(&(fb, lb))
+    });
+
+    let elapsed = timer.elapsed();
+    Ok(json!({
+        "ok": true,
+        "command": "link",
+        "link": q,
+        "notes": notes,
+        "result_count": results.len(),
+        "results": results,
+        "elapsed_secs": elapsed.as_secs_f64(),
+        "index_staleness": index_staleness
+    }))
+}
+
 fn matches_search_filters(component: &ComponentRecord, query: &SearchQuery) -> bool {
     if let Some(language) = &query.language {
         if component.language != *language {
@@ -1171,7 +1292,9 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
         AnnotateAction::Add {
             component_id,
             message,
+            body_file,
             tags,
+            links,
         } => {
             let component = index
                 .components
@@ -1194,6 +1317,36 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
             } else {
                 tags
             };
+            let merged_links = if links.is_empty() {
+                existing
+                    .as_ref()
+                    .map(|a| a.links.clone())
+                    .unwrap_or_default()
+            } else {
+                links
+            };
+
+            let body_path = body_file.as_ref().map(|p| {
+                if p.is_absolute() {
+                    p.clone()
+                } else {
+                    root.join(p)
+                }
+            });
+
+            let content = if let Some(msg) = message {
+                msg
+            } else if let Some(ref p) = body_path {
+                fs::read_to_string(p).with_context(|| {
+                    format!("failed reading annotation body file: {}", p.display())
+                })?
+            } else if let Some(ref e) = existing {
+                e.content.clone()
+            } else {
+                bail!(
+                    "annotate add requires --message, --file, or an existing annotation (to update links/tags only)"
+                );
+            };
 
             let (comp_type, _) = component_id
                 .split_once('-')
@@ -1205,8 +1358,9 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
                 component_name: component.name.clone(),
                 file: Some(component.file.clone()),
                 language: Some(component.language.clone()),
-                content: message.clone(),
+                content,
                 tags: merged_tags,
+                links: merged_links,
                 created_at,
                 updated_at: now,
             };
@@ -1225,6 +1379,7 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
                     "hash_id": annotation.hash_id,
                     "content": annotation.content,
                     "tags": annotation.tags,
+                    "links": annotation.links,
                     "created_at": annotation.created_at,
                     "updated_at": annotation.updated_at
                 }
@@ -1250,6 +1405,8 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
                 "annotation": {
                     "hash_id": annotation.hash_id,
                     "content": annotation.content,
+                    "tags": annotation.tags,
+                    "links": annotation.links,
                     "created_at": annotation.created_at,
                     "updated_at": annotation.updated_at
                 }
@@ -1281,6 +1438,8 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
                             "hash_id": ann.hash_id,
                             "content": ann.content,
                             "preview": truncate_preview(&ann.content, 80),
+                            "tags": ann.tags,
+                            "links": ann.links,
                             "created_at": ann.created_at,
                             "updated_at": ann.updated_at
                         }
@@ -1409,6 +1568,7 @@ fn is_component_type_filter(value: &str) -> bool {
             | "init"
             | "deinit"
             | "typealias"
+            | "subscript"
     )
 }
 

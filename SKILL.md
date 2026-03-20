@@ -130,6 +130,21 @@ lime --json search python class Auth
 
 When `--fuzzy` is used, `match_type` can be: `exact`, `prefix`, `substring`, `annotation`. If match came from annotation content, `annotation_preview` contains first 80 chars.
 
+### lime link
+
+List components whose annotations share a **link** label (cross-component topic / pipeline). Set links with `lime annotate add --link <name>`. Matching is case-insensitive.
+
+```bash
+lime --json link auth
+lime --json link auth --notes
+```
+
+| Flag | Description |
+|------|-------------|
+| `--notes` | Include full annotation markdown per result (default is a short preview only) |
+
+**JSON Output:** `results` entries include `component`, `links`, `tags`, and either `annotation_preview` or full `annotation` when `--notes` is set.
+
 ### lime list
 
 List indexed languages or components.
@@ -268,25 +283,30 @@ Attach semantic annotations to components.
 ```bash
 lime --json annotate add fn-61bcc6dabec3f308 -m "Entry point for CLI execution"
 lime --json annotate add fn-abc123 -m "Auth handler" -t security -t critical
+lime --json annotate add fn-abc123 -m "Login flow" -l auth
+lime --json annotate add fn-abc123 --file docs/notes/fn-abc123.md -l auth
 ```
 
 | Flag | Description |
 |------|-------------|
-| `-m <message>` | Annotation content (required) |
-| `-t <tag>` | Add tag (repeatable) |
+| `-m, --message` | Inline markdown body (mutually exclusive with `--file`) |
+| `--file` | Read annotation body from this path (repo-relative or absolute; mutually exclusive with `-m`) |
+| `-t, --tag` | Tag (repeatable); e.g. `keep`, `public_api`, `entrypoint` |
+| `-l, --link` | Link label (repeatable); group components for `lime link <name>` |
+
+Provide **`-m` or `--file`**, or update an **existing** annotation to change only tags/links.
 
 **JSON Output:**
 ```json
 {
   "ok": true,
-  "command": "annotate add",
-  "component_id": "fn-61bcc6dabec3f308",
+  "command": "annotate",
+  "action": "add",
   "annotation": {
     "hash_id": "fn-61bcc6dabec3f308",
-    "component_name": "run",
-    "component_type": "fn",
     "content": "Entry point for CLI execution",
     "tags": [],
+    "links": ["auth"],
     "created_at": "2026-03-20T05:00:00Z",
     "updated_at": "2026-03-20T05:00:00Z"
   }
@@ -303,14 +323,13 @@ lime --json annotate show fn-61bcc6dabec3f308
 ```json
 {
   "ok": true,
-  "command": "annotate show",
-  "component_id": "fn-61bcc6dabec3f308",
+  "command": "annotate",
+  "action": "show",
   "annotation": {
     "hash_id": "fn-61bcc6dabec3f308",
-    "component_name": "run",
-    "component_type": "fn",
     "content": "Entry point for CLI execution",
     "tags": [],
+    "links": [],
     "created_at": "2026-03-20T05:00:00Z",
     "updated_at": "2026-03-20T05:00:00Z"
   }
@@ -329,15 +348,18 @@ lime --json annotate list rust fn
 ```json
 {
   "ok": true,
-  "command": "annotate list",
-  "annotations": [
+  "command": "annotate",
+  "action": "list",
+  "results": [
     {
-      "hash_id": "fn-61bcc6dabec3f308",
-      "component_name": "run",
-      "component_type": "fn",
-      "content": "Entry point for CLI execution",
-      "tags": [],
-      "created_at": "2026-03-20T05:00:00Z"
+      "component": { "id": "fn-61bcc6dabec3f308", "name": "run", "type": "fn" },
+      "annotation": {
+        "hash_id": "fn-61bcc6dabec3f308",
+        "preview": "Entry point…",
+        "tags": [],
+        "links": [],
+        "created_at": "2026-03-20T05:00:00Z"
+      }
     }
   ]
 }
@@ -501,7 +523,7 @@ Lime reads `.lime/lime.json` for settings:
 | zig | fn, struct, enum, const |
 | c | function, struct, enum, typedef |
 | cpp | function, class, struct, enum, typedef |
-| swift | struct, class, enum, protocol, actor, extension, func, init, deinit, import, typealias |
+| swift | struct, class, enum, protocol, actor, extension, func, init, deinit, import, typealias, subscript |
 
 ## Error Handling
 

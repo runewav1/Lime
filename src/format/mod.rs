@@ -104,6 +104,7 @@ pub fn render(payload: &Value) -> String {
         "add" => render_add(payload, &s),
         "remove" => render_remove(payload, &s),
         "search" => render_search(payload, &s),
+        "link" => render_link(payload, &s),
         "list" => render_list(payload, &s),
         "deps" => render_deps(payload, &s),
         "annotate" => render_annotate(payload, &s),
@@ -319,6 +320,108 @@ fn render_search(v: &Value, s: &Style) -> String {
         out,
         "\n{}{}",
         s.bold(&format!("{count} result{}", plural(count))),
+        timing
+    );
+    out
+}
+
+// ── link (annotation link labels) ───────────────────────────────
+
+fn render_link(v: &Value, s: &Style) -> String {
+    let mut out = String::new();
+    write_staleness_banner(&mut out, v, s);
+    let count = num_val(v, "result_count");
+    let notes = v.get("notes").and_then(Value::as_bool).unwrap_or(false);
+    let link_label = str_val(v, "link");
+
+    if count == 0 {
+        let _ = writeln!(
+            out,
+            "No components with link {}",
+            s.dim(&link_label)
+        );
+        return out;
+    }
+
+    let _ = writeln!(
+        out,
+        "{} {}",
+        s.bold("link:"),
+        s.cyan(&link_label)
+    );
+    if notes {
+        let _ = writeln!(out, "{}", s.dim("(with full annotation notes)"));
+    }
+    let _ = writeln!(out);
+
+    if let Some(results) = v.get("results").and_then(Value::as_array) {
+        for entry in results {
+            let comp = entry.get("component").unwrap_or(entry);
+            let name = display_name(&str_val(comp, "name"));
+            let ctype = str_val(comp, "type");
+            let file = str_val(comp, "file");
+            let start = num_val(comp, "start_line");
+            let id = str_val(comp, "id");
+            let _ = writeln!(
+                out,
+                "  {} ({})  {file}:{start}  {}",
+                s.bold(&name),
+                s.cyan(&ctype),
+                s.dim(&id)
+            );
+
+            let links_json = entry.get("links").and_then(Value::as_array);
+            let tags_json = entry.get("tags").and_then(Value::as_array);
+            if let Some(arr) = links_json {
+                let joined: Vec<String> = arr
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|x| x.to_string())
+                    .collect();
+                if !joined.is_empty() {
+                    let _ = writeln!(out, "    {} {}", s.dim("links:"), joined.join(", "));
+                }
+            }
+            if let Some(arr) = tags_json {
+                let joined: Vec<String> = arr
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|x| x.to_string())
+                    .collect();
+                if !joined.is_empty() {
+                    let _ = writeln!(out, "    {} {}", s.dim("tags:"), joined.join(", "));
+                }
+            }
+
+            if notes {
+                if let Some(ann) = entry.get("annotation") {
+                    let content = str_val(ann, "content");
+                    for line in content.lines() {
+                        let _ = writeln!(out, "    {line}");
+                    }
+                    if content.is_empty() {
+                        let _ = writeln!(out, "    {}", s.dim("(empty)"));
+                    }
+                }
+            } else {
+                let preview = str_val(entry, "annotation_preview");
+                if !preview.is_empty() {
+                    let _ = writeln!(out, "    {}", s.dim(&preview));
+                }
+            }
+            let _ = writeln!(out);
+        }
+    }
+
+    let timing = v
+        .get("elapsed_secs")
+        .and_then(Value::as_f64)
+        .map(|e| format!(" in {}", s.dim(&format_duration(e))))
+        .unwrap_or_default();
+    let _ = writeln!(
+        out,
+        "{}{}",
+        s.bold(&format!("{count} component{}", plural(count))),
         timing
     );
     out
@@ -873,6 +976,16 @@ fn render_annotate_add(v: &Value, s: &Style) -> String {
             content
         };
         let _ = writeln!(out, "    {}", s.dim(&preview));
+        if let Some(arr) = ann.get("links").and_then(Value::as_array) {
+            let joined: Vec<String> = arr
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|x| x.to_string())
+                .collect();
+            if !joined.is_empty() {
+                let _ = writeln!(out, "    {} {}", s.dim("links:"), joined.join(", "));
+            }
+        }
     }
 
     if let Some(elapsed) = v.get("elapsed_secs").and_then(Value::as_f64) {
@@ -915,6 +1028,26 @@ fn render_annotate_show(v: &Value, s: &Style) -> String {
             s.dim("updated:"),
             s.dim(&updated)
         );
+        if let Some(arr) = ann.get("tags").and_then(Value::as_array) {
+            let joined: Vec<String> = arr
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|x| x.to_string())
+                .collect();
+            if !joined.is_empty() {
+                let _ = writeln!(out, "  {} {}", s.dim("tags:"), joined.join(", "));
+            }
+        }
+        if let Some(arr) = ann.get("links").and_then(Value::as_array) {
+            let joined: Vec<String> = arr
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|x| x.to_string())
+                .collect();
+            if !joined.is_empty() {
+                let _ = writeln!(out, "  {} {}", s.dim("links:"), joined.join(", "));
+            }
+        }
         let _ = writeln!(out);
         let content = str_val(ann, "content");
         for line in content.lines() {
@@ -975,6 +1108,22 @@ fn render_annotate_list(v: &Value, s: &Style) -> String {
             let _ = writeln!(out, "  {padded_label}  {padded_loc}");
             if !previews[i].is_empty() {
                 let _ = writeln!(out, "    {}", s.dim(&previews[i]));
+            }
+            if let Some(entry) = results.get(i) {
+                if let Some(arr) = entry
+                    .get("annotation")
+                    .and_then(|a| a.get("links"))
+                    .and_then(Value::as_array)
+                {
+                    let joined: Vec<String> = arr
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|x| x.to_string())
+                        .collect();
+                    if !joined.is_empty() {
+                        let _ = writeln!(out, "    {} {}", s.dim("links:"), joined.join(", "));
+                    }
+                }
             }
         }
     }
