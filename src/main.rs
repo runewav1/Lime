@@ -7,6 +7,7 @@ mod diagnostics;
 mod format;
 mod git_staleness;
 mod index;
+mod links;
 mod parse;
 mod search;
 mod storage;

@@ -105,6 +105,7 @@ pub fn render(payload: &Value) -> String {
         "remove" => render_remove(payload, &s),
         "search" => render_search(payload, &s),
         "link" => render_link(payload, &s),
+        "links" => render_links_cmd(payload, &s),
         "sum" => render_sum(payload, &s),
         "list" => render_list(payload, &s),
         "deps" => render_deps(payload, &s),
@@ -326,7 +327,69 @@ fn render_search(v: &Value, s: &Style) -> String {
     out
 }
 
-// ── link (annotation link labels) ───────────────────────────────
+// ── link (merged link paths) ────────────────────────────────────
+
+fn write_link_component_lines(out: &mut String, s: &Style, entry: &Value, notes: bool, base: &str) {
+    let comp = entry.get("component").unwrap_or(entry);
+    let name = display_name(&str_val(comp, "name"));
+    let ctype = str_val(comp, "type");
+    let file = str_val(comp, "file");
+    let start = num_val(comp, "start_line");
+    let id = str_val(comp, "id");
+    let detail = format!("{base}  ");
+    let _ = writeln!(
+        out,
+        "{}{} ({})  {file}:{start}  {}",
+        base,
+        s.bold(&name),
+        s.cyan(&ctype),
+        s.dim(&id)
+    );
+
+    let links_json = entry.get("links").and_then(Value::as_array);
+    let tags_json = entry.get("tags").and_then(Value::as_array);
+    if let Some(arr) = links_json {
+        let joined: Vec<String> = arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|x| x.to_string())
+            .collect();
+        if !joined.is_empty() {
+            let _ = writeln!(out, "{} {} {}", detail, s.dim("links:"), joined.join(", "));
+        }
+    }
+    if let Some(arr) = tags_json {
+        let joined: Vec<String> = arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|x| x.to_string())
+            .collect();
+        if !joined.is_empty() {
+            let _ = writeln!(out, "{} {} {}", detail, s.dim("tags:"), joined.join(", "));
+        }
+    }
+
+    if notes {
+        if let Some(ann) = entry.get("annotation") {
+            if ann.is_null() {
+                let _ = writeln!(out, "{} {}", detail, s.dim("(no annotation)"));
+            } else {
+                let content = str_val(ann, "content");
+                for line in content.lines() {
+                    let _ = writeln!(out, "{detail}{line}");
+                }
+                if content.is_empty() {
+                    let _ = writeln!(out, "{} {}", detail, s.dim("(empty)"));
+                }
+            }
+        }
+    } else {
+        let preview = str_val(entry, "annotation_preview");
+        if !preview.is_empty() {
+            let _ = writeln!(out, "{}{}", detail, s.dim(&preview));
+        }
+    }
+}
 
 fn render_link(v: &Value, s: &Style) -> String {
     let mut out = String::new();
@@ -339,7 +402,7 @@ fn render_link(v: &Value, s: &Style) -> String {
     if count == 0 {
         let _ = writeln!(
             out,
-            "No indexed components with link {}",
+            "No indexed components matching link path {}",
             s.dim(&link_label)
         );
         if orphan_count > 0 {
@@ -347,7 +410,7 @@ fn render_link(v: &Value, s: &Style) -> String {
                 out,
                 "{}",
                 s.yellow(&format!(
-                    "  {orphan_count} orphan annotation(s) match this link (no index component; see JSON \"orphans\")"
+                    "  {orphan_count} orphan(s): stale link-store IDs and/or annotations without index (see JSON \"orphan_memberships\" / \"orphans\")"
                 ))
             );
         }
@@ -365,61 +428,32 @@ fn render_link(v: &Value, s: &Style) -> String {
     }
     let _ = writeln!(out);
 
-    if let Some(results) = v.get("results").and_then(Value::as_array) {
+    let use_path_groups = v
+        .get("path_groups")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+
+    if use_path_groups {
+        if let Some(groups) = v.get("path_groups").and_then(Value::as_array) {
+            for group in groups {
+                let path = group.get("path").and_then(Value::as_str).unwrap_or("");
+                let depth = group.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let path_ind = "  ".repeat(depth.saturating_add(1));
+                let _ = writeln!(out, "{}{}", path_ind, s.bold(&s.cyan(path)));
+                if let Some(comps) = group.get("components").and_then(Value::as_array) {
+                    for entry in comps {
+                        let comp_ind = format!("{path_ind}  ");
+                        write_link_component_lines(&mut out, s, entry, notes, &comp_ind);
+                        let _ = writeln!(out);
+                    }
+                } else {
+                    let _ = writeln!(out);
+                }
+            }
+        }
+    } else if let Some(results) = v.get("results").and_then(Value::as_array) {
         for entry in results {
-            let comp = entry.get("component").unwrap_or(entry);
-            let name = display_name(&str_val(comp, "name"));
-            let ctype = str_val(comp, "type");
-            let file = str_val(comp, "file");
-            let start = num_val(comp, "start_line");
-            let id = str_val(comp, "id");
-            let _ = writeln!(
-                out,
-                "  {} ({})  {file}:{start}  {}",
-                s.bold(&name),
-                s.cyan(&ctype),
-                s.dim(&id)
-            );
-
-            let links_json = entry.get("links").and_then(Value::as_array);
-            let tags_json = entry.get("tags").and_then(Value::as_array);
-            if let Some(arr) = links_json {
-                let joined: Vec<String> = arr
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|x| x.to_string())
-                    .collect();
-                if !joined.is_empty() {
-                    let _ = writeln!(out, "    {} {}", s.dim("links:"), joined.join(", "));
-                }
-            }
-            if let Some(arr) = tags_json {
-                let joined: Vec<String> = arr
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|x| x.to_string())
-                    .collect();
-                if !joined.is_empty() {
-                    let _ = writeln!(out, "    {} {}", s.dim("tags:"), joined.join(", "));
-                }
-            }
-
-            if notes {
-                if let Some(ann) = entry.get("annotation") {
-                    let content = str_val(ann, "content");
-                    for line in content.lines() {
-                        let _ = writeln!(out, "    {line}");
-                    }
-                    if content.is_empty() {
-                        let _ = writeln!(out, "    {}", s.dim("(empty)"));
-                    }
-                }
-            } else {
-                let preview = str_val(entry, "annotation_preview");
-                if !preview.is_empty() {
-                    let _ = writeln!(out, "    {}", s.dim(&preview));
-                }
-            }
+            write_link_component_lines(&mut out, s, entry, notes, "  ");
             let _ = writeln!(out);
         }
     }
@@ -440,10 +474,91 @@ fn render_link(v: &Value, s: &Style) -> String {
             out,
             "{}",
             s.yellow(&format!(
-                "{orphan_count} orphan annotation(s) also matched (see JSON \"orphans\")"
+                "{orphan_count} orphan(s) also matched (see JSON \"orphan_memberships\" / \"orphans\")"
             ))
         );
     }
+    out
+}
+
+fn render_links_cmd(v: &Value, s: &Style) -> String {
+    let mut out = String::new();
+    write_staleness_banner(&mut out, v, s);
+    let action = v.get("action").and_then(Value::as_str).unwrap_or("");
+
+    match action {
+        "list" => {
+            let tree = v.get("tree").and_then(Value::as_bool).unwrap_or(false);
+            if let Some(prefix) = v.get("prefix").and_then(Value::as_str) {
+                if !prefix.is_empty() {
+                    let _ = writeln!(out, "{} {}", s.bold("prefix:"), s.cyan(prefix));
+                    let _ = writeln!(out);
+                }
+            }
+            if let Some(paths) = v.get("paths").and_then(Value::as_array) {
+                if tree {
+                    for p in paths.iter().filter_map(Value::as_str) {
+                        let depth = p.matches('/').count();
+                        let ind = "  ".repeat(depth.saturating_add(1));
+                        let _ = writeln!(out, "{}{}", ind, s.cyan(p));
+                    }
+                } else {
+                    for p in paths.iter().filter_map(Value::as_str) {
+                        let _ = writeln!(out, "  {}", s.cyan(p));
+                    }
+                }
+            }
+            let n = v.get("path_count").and_then(Value::as_u64).unwrap_or(0);
+            let timing = v
+                .get("elapsed_secs")
+                .and_then(Value::as_f64)
+                .map(|e| format!(" in {}", s.dim(&format_duration(e))))
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "\n{}{}",
+                s.bold(&format!("{n} path{}", plural(n))),
+                timing
+            );
+        }
+        "add" => {
+            let id = str_val(v, "component_id");
+            let path = str_val(v, "path");
+            let _ = writeln!(
+                out,
+                "{} {} → {}",
+                s.bold_green("added"),
+                s.dim(&id),
+                s.cyan(&path)
+            );
+        }
+        "remove" => {
+            let id = str_val(v, "component_id");
+            let path = str_val(v, "path");
+            let removed = v.get("removed").and_then(Value::as_bool).unwrap_or(false);
+            let status = if removed { s.bold_green("removed") } else { s.yellow("not found") };
+            let _ = writeln!(
+                out,
+                "{} {} → {}",
+                status,
+                s.dim(&id),
+                s.cyan(&path)
+            );
+        }
+        "compact" => {
+            let n = v.get("annotations_updated").and_then(Value::as_u64).unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "{} {}",
+                s.bold("compact:"),
+                s.dim(&format!("updated {n} annotation file(s); duplicate link lines removed where store already has the path"))
+            );
+        }
+        _ => {
+            return serde_json::to_string_pretty(v).unwrap_or_default();
+        }
+    }
+
     out
 }
 

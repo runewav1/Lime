@@ -467,7 +467,11 @@ pub fn tokenize_content(content: &str) -> Vec<String> {
 // Token index construction
 // ---------------------------------------------------------------------------
 
-pub fn build_token_index(index: &IndexData, annotations: &[Annotation]) -> SearchTokenIndex {
+pub fn build_token_index(
+    index: &IndexData,
+    annotations: &[Annotation],
+    link_paths_by_component: &std::collections::HashMap<String, Vec<String>>,
+) -> SearchTokenIndex {
     let valid_component_ids = index
         .components
         .iter()
@@ -515,6 +519,35 @@ pub fn build_token_index(index: &IndexData, annotations: &[Annotation]) -> Searc
         add_tokens(
             &component.id,
             ann_tokens,
+            &mut token_to_components,
+            &mut component_tokens,
+            &mut annotation_token_to_components,
+        );
+    }
+
+    for component in &index.components {
+        let Some(paths) = link_paths_by_component.get(&component.id) else {
+            continue;
+        };
+        if !valid_component_ids.contains(component.id.as_str()) {
+            continue;
+        }
+        let mut link_tokens: Vec<String> = Vec::new();
+        for path in paths {
+            let lower = path.to_ascii_lowercase();
+            if !link_tokens.contains(&lower) {
+                link_tokens.push(lower.clone());
+            }
+            for seg in path.split('/') {
+                let t = seg.trim().to_ascii_lowercase();
+                if t.len() >= 2 && !link_tokens.contains(&t) {
+                    link_tokens.push(t);
+                }
+            }
+        }
+        add_tokens(
+            &component.id,
+            link_tokens,
             &mut token_to_components,
             &mut component_tokens,
             &mut annotation_token_to_components,
@@ -914,6 +947,8 @@ fn token_has_component(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
         build_token_index, edit_distance, fuzzy_search, generate_trigrams, name_match_with_fuzzy,
         tokenize_content, tokenize_name, MatchType, PersistedTokenIndex,
@@ -986,7 +1021,7 @@ mod tests {
             updated_at: "2026-03-17T00:00:00Z".to_string(),
         }];
 
-        let token_index = build_token_index(&index, &annotations);
+        let token_index = build_token_index(&index, &annotations, &HashMap::new());
 
         assert_eq!(
             token_index.token_to_components.get("parse"),
@@ -1029,7 +1064,7 @@ mod tests {
             created_at: "2026-03-17T00:00:00Z".to_string(),
             updated_at: "2026-03-17T00:00:00Z".to_string(),
         }];
-        let token_index = build_token_index(&index, &annotations);
+        let token_index = build_token_index(&index, &annotations, &HashMap::new());
 
         let exact_hits = fuzzy_search(&token_index, "run");
         assert_eq!(exact_hits[0].component_id, "fn-run");
@@ -1071,7 +1106,7 @@ mod tests {
             created_at: "2026-03-17T00:00:00Z".to_string(),
             updated_at: "2026-03-17T00:00:00Z".to_string(),
         }];
-        let token_index = build_token_index(&index, &annotations);
+        let token_index = build_token_index(&index, &annotations, &HashMap::new());
         let hits = fuzzy_search(&token_index, "parse components");
 
         assert_eq!(hits[0].component_id, "fn-parser");
@@ -1116,7 +1151,7 @@ mod tests {
     #[test]
     fn token_index_roundtrips_through_persistence() {
         let index = sample_index(vec![component("fn-a", "hello")]);
-        let token_index = build_token_index(&index, &[]);
+        let token_index = build_token_index(&index, &[], &HashMap::new());
         let persisted = PersistedTokenIndex::from(&token_index);
         let json = serde_json::to_string(&persisted).unwrap();
         let restored: PersistedTokenIndex = serde_json::from_str(&json).unwrap();
@@ -1185,7 +1220,7 @@ mod tests {
             component("fn-parse", "parse"),
             component("fn-parser", "parser"),
         ]);
-        let token_index = build_token_index(&index, &[]);
+        let token_index = build_token_index(&index, &[], &HashMap::new());
 
         let dep_stem = super::stem("dependency");
         let siblings = token_index.stem_index.get(&dep_stem);
@@ -1201,7 +1236,7 @@ mod tests {
             component("fn-die", "death_handler"),
             component("fn-alive", "keepAlive"),
         ]);
-        let token_index = build_token_index(&index, &[]);
+        let token_index = build_token_index(&index, &[], &HashMap::new());
         let hits = fuzzy_search(&token_index, "dead");
         let ids: Vec<&str> = hits.iter().map(|h| h.component_id.as_str()).collect();
         assert!(ids.contains(&"fn-die"), "searching 'dead' should find 'death_handler' via alias, got: {ids:?}");
@@ -1214,7 +1249,7 @@ mod tests {
             component("fn-set", "configureApp"),
             component("fn-misc", "unrelated"),
         ]);
-        let token_index = build_token_index(&index, &[]);
+        let token_index = build_token_index(&index, &[], &HashMap::new());
         let hits = fuzzy_search(&token_index, "config");
         let ids: Vec<&str> = hits.iter().map(|h| h.component_id.as_str()).collect();
         assert!(ids.contains(&"fn-cfg"), "searching 'config' should find 'loadConfiguration', got: {ids:?}");
@@ -1227,7 +1262,7 @@ mod tests {
             component("fn-cfg", "config_loader"),
             component("fn-misc", "unrelated"),
         ]);
-        let token_index = build_token_index(&index, &[]);
+        let token_index = build_token_index(&index, &[], &HashMap::new());
         let hits = fuzzy_search(&token_index, "configuration");
         let ids: Vec<&str> = hits.iter().map(|h| h.component_id.as_str()).collect();
         assert!(ids.contains(&"fn-cfg"), "searching 'configuration' should find 'config_loader', got: {ids:?}");
@@ -1239,7 +1274,7 @@ mod tests {
             component("fn-exact", "dead"),
             component("fn-alias", "death_handler"),
         ]);
-        let token_index = build_token_index(&index, &[]);
+        let token_index = build_token_index(&index, &[], &HashMap::new());
         let hits = fuzzy_search(&token_index, "dead");
         assert!(hits.len() >= 2);
         assert_eq!(hits[0].component_id, "fn-exact", "exact match should rank first");
@@ -1274,7 +1309,7 @@ mod tests {
             component("fn-deps", "loadDependencies"),
             component("fn-unrelated", "handleAuth"),
         ]);
-        let token_index = build_token_index(&index, &[]);
+        let token_index = build_token_index(&index, &[], &HashMap::new());
 
         let hits = fuzzy_search(&token_index, "dependency");
         let hit_ids: Vec<&str> = hits.iter().map(|h| h.component_id.as_str()).collect();

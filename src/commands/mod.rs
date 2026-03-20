@@ -17,6 +17,7 @@ use crate::{
     diagnostics,
     git_staleness,
     index::{self, ComponentRecord, DeathStatus, IndexData},
+    links,
     search::{self, MatchType},
     storage,
 };
@@ -67,6 +68,7 @@ pub fn run() -> Result<()> {
             fuzzy,
         } => handle_search(root, terms, fuzzy),
         Commands::Link { label, notes } => handle_link(root, label, notes),
+        Commands::Links { action } => handle_links(root, action),
         Commands::Sum { top_links } => handle_sum(root, top_links),
         Commands::List {
             language,
@@ -129,7 +131,8 @@ fn exit_error(message: &str, json_mode: bool) -> ! {
   lime list rust                 Show Rust component counts
   lime list rust --all           List all Rust components
   lime deps fn-61bcc6dabec3f308  Show dependency matrix
-  lime link auth                 Components annotated with link \"auth\"
+  lime link auth                 Components in link path auth (store + annotations)
+  lime links add fn-abc auth     Add membership in .lime/component_links.json
   lime sum                       Bounded overview (counts, links, staleness)"#
 )]
 struct Cli {
@@ -203,20 +206,37 @@ enum Commands {
         #[arg(long)]
         fuzzy: bool,
     },
-    /// List components that share an annotation link label (topic / pipeline).
+    /// List components that share a link path (topic / pipeline).
     ///
-    /// Uses the `links` field on annotations (`lime annotate add --link <name>`).
-    /// Matching is case-insensitive. Add `--notes` to include full annotation bodies.
+    /// Membership comes from `.lime/component_links.json` merged with annotation
+    /// `links` (see `lime links`). Matching is prefix-aware: query `auth` matches
+    /// `auth` and `auth/login`. Add `--notes` to include full annotation bodies.
     ///
     /// Examples:
     ///   "lime link auth"
+    ///   "lime link auth/login"
     ///   "lime link auth --notes"
     Link {
-        /// Link label to match (e.g. `auth`).
+        /// Link path or prefix to match (e.g. `auth`, `auth/login`).
         label: String,
         /// Include full annotation markdown in each result.
         #[arg(long)]
         notes: bool,
+    },
+    /// Manage link path memberships in `.lime/component_links.json`.
+    ///
+    /// Use `lime links add` / `remove` without touching annotation prose.
+    /// `lime link` queries merged memberships (store + annotation links).
+    ///
+    /// Examples:
+    ///   "lime links add fn-abc123 auth/login"
+    ///   "lime links remove fn-abc123 auth/login"
+    ///   "lime links list"
+    ///   "lime links list auth --tree"
+    ///   "lime links compact"
+    Links {
+        #[command(subcommand)]
+        action: LinksAction,
     },
     /// Bounded index overview for agents (counts, top link labels, staleness; no component list).
     ///
@@ -317,6 +337,32 @@ enum Commands {
 }
 
 #[derive(Debug, Subcommand)]
+enum LinksAction {
+    /// Add a link path for a component (writes `.lime/component_links.json`).
+    Add {
+        /// Component ID (from `lime search` or `lime list --all`).
+        component_id: String,
+        /// Link path using `/` segments (e.g. `auth/login`).
+        path: String,
+    },
+    /// Remove a link path from the link store for a component.
+    Remove {
+        component_id: String,
+        path: String,
+    },
+    /// List distinct link paths across the project (merged store + annotations).
+    List {
+        /// Only paths equal to or under this prefix (case-insensitive).
+        prefix: Option<String>,
+        /// Indent paths by `/` depth for terminal output.
+        #[arg(long)]
+        tree: bool,
+    },
+    /// Drop duplicate `links` from annotation files when the path exists in the link store.
+    Compact,
+}
+
+#[derive(Debug, Subcommand)]
 enum AnnotateAction {
     /// Add or update an annotation on a component.
     ///
@@ -326,8 +372,8 @@ enum AnnotateAction {
     /// Examples:
     ///   "lime annotate add fn-abc123 -m 'Entry point for auth flow'"
     ///   "lime annotate add struct-def456 -m 'Primary data model for users'"
-    ///   "lime annotate add fn-x --file docs/fn-x.md --link auth"
-    ///   "lime annotate add fn-x --link auth"   (updates links only if annotation exists)
+    ///   "lime annotate add fn-x --file docs/fn-x.md --link auth/login"
+    ///   "lime annotate add fn-x --link auth"   (updates links only if annotation exists; dual-writes link store)
     Add {
         /// Component ID (from `lime search` or `lime list --all`).
         component_id: String,
@@ -340,7 +386,7 @@ enum AnnotateAction {
         /// Tags for the annotation (e.g. keep, public_api, entrypoint).
         #[arg(short = 't', long = "tag")]
         tags: Vec<String>,
-        /// Link labels: group components for `lime link <name>` (topic / pipeline).
+        /// Link paths (`/` segments); dual-written to `.lime/component_links.json` and annotation frontmatter.
         #[arg(short = 'l', long = "link")]
         links: Vec<String>,
     },
@@ -458,13 +504,11 @@ fn handle_sum(root: PathBuf, top_links: usize) -> Result<Value> {
     let diag_cache = storage::load_diagnostics_cache(&root).unwrap_or_default();
 
     let top = top_links.clamp(1, 256);
+    let merged_links = links::merged_link_paths_by_component(&root, &index, &all_annotations);
     let mut link_counts: HashMap<String, usize> = HashMap::new();
-    for ann in &all_annotations {
-        for link in &ann.links {
-            let key = link.trim().to_ascii_lowercase();
-            if key.is_empty() {
-                continue;
-            }
+    for paths in merged_links.values() {
+        for p in paths {
+            let key = p.to_ascii_lowercase();
             *link_counts.entry(key).or_insert(0) += 1;
         }
     }
@@ -879,8 +923,10 @@ fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value
     let exact_ids: HashSet<String> = results.iter().map(|c| c.id.clone()).collect();
 
     let all_annotations = annotations::list_annotations(&root).unwrap_or_default();
-    let token_index = storage::load_token_index(&root)?
-        .unwrap_or_else(|| search::build_token_index(&index, &all_annotations));
+    let link_map = links::merged_link_paths_by_component(&root, &index, &all_annotations);
+    let token_index = storage::load_token_index(&root)?.unwrap_or_else(|| {
+        search::build_token_index(&index, &all_annotations, &link_map)
+    });
     let fuzzy_hits = if fuzzy {
         search::fuzzy_search(&token_index, &query.query)
     } else {
@@ -1016,15 +1062,144 @@ fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value
     }))
 }
 
-fn annotation_matches_link(annotation: &annotations::Annotation, label: &str) -> bool {
-    let q = label.trim();
+fn annotation_links_match_query(annotation: &annotations::Annotation, query: &str) -> bool {
+    let q = query.trim();
     if q.is_empty() {
         return false;
     }
-    annotation
-        .links
-        .iter()
-        .any(|l| l.trim().eq_ignore_ascii_case(q))
+    annotation.links.iter().any(|l| {
+        let t = l.trim();
+        if t.is_empty() {
+            return false;
+        }
+        match links::validate_link_path(t) {
+            Ok(p) => links::path_matches_link_query(&p, q),
+            Err(_) => t.eq_ignore_ascii_case(q),
+        }
+    })
+}
+
+fn link_path_display_depth(path: &str) -> usize {
+    path.matches('/').count()
+}
+
+fn json_for_link_result(
+    comp: &ComponentRecord,
+    merged_paths: &[String],
+    ann: Option<&annotations::Annotation>,
+    notes: bool,
+) -> Value {
+    let tags = ann.map(|a| a.tags.clone()).unwrap_or_default();
+    let links_json: Vec<&str> = merged_paths.iter().map(String::as_str).collect();
+    if notes {
+        if let Some(a) = ann {
+            json!({
+                "component": comp,
+                "links": links_json,
+                "tags": tags,
+                "annotation": {
+                    "hash_id": a.hash_id,
+                    "content": a.content,
+                    "tags": a.tags,
+                    "links": a.links,
+                    "created_at": a.created_at,
+                    "updated_at": a.updated_at,
+                }
+            })
+        } else {
+            json!({
+                "component": comp,
+                "links": links_json,
+                "tags": tags,
+                "annotation": Value::Null,
+            })
+        }
+    } else {
+        let preview = ann
+            .map(|a| truncate_preview(&a.content, 120))
+            .unwrap_or_default();
+        json!({
+            "component": comp,
+            "links": links_json,
+            "tags": tags,
+            "annotation_preview": preview,
+        })
+    }
+}
+
+fn handle_links(root: PathBuf, action: LinksAction) -> Result<Value> {
+    let config = LimeConfig::load_or_create(&root)?;
+    let timer = std::time::Instant::now();
+    let index = storage::load_index_or_empty(&root, &config)?;
+
+    let response = match action {
+        LinksAction::Add { component_id, path } => {
+            index
+                .components
+                .iter()
+                .find(|c| c.id == component_id)
+                .ok_or_else(|| anyhow!("component not found: {component_id}"))?;
+            links::add_membership(&root, &component_id, &path)?;
+            persist_token_index(&root, &index);
+            json!({
+                "ok": true,
+                "command": "links",
+                "action": "add",
+                "component_id": component_id,
+                "path": path.trim(),
+            })
+        }
+        LinksAction::Remove { component_id, path } => {
+            let removed = links::remove_membership(&root, &component_id, &path)?;
+            persist_token_index(&root, &index);
+            json!({
+                "ok": true,
+                "command": "links",
+                "action": "remove",
+                "component_id": component_id,
+                "path": path.trim(),
+                "removed": removed,
+            })
+        }
+        LinksAction::List { prefix, tree } => {
+            let all_annotations = annotations::list_annotations(&root).unwrap_or_default();
+            let paths = links::distinct_merged_paths(
+                &root,
+                &index,
+                &all_annotations,
+                prefix.as_deref(),
+            );
+            json!({
+                "ok": true,
+                "command": "links",
+                "action": "list",
+                "tree": tree,
+                "prefix": prefix,
+                "path_count": paths.len(),
+                "paths": paths,
+            })
+        }
+        LinksAction::Compact => {
+            let updated = links::compact_annotation_links(&root, &index)?;
+            persist_token_index(&root, &index);
+            json!({
+                "ok": true,
+                "command": "links",
+                "action": "compact",
+                "annotations_updated": updated,
+            })
+        }
+    };
+
+    let elapsed = timer.elapsed();
+    let mut out = response;
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "elapsed_secs".into(),
+            json!(elapsed.as_secs_f64()),
+        );
+    }
+    Ok(out)
 }
 
 fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
@@ -1036,53 +1211,92 @@ fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
 
     let q = label.trim();
     if q.is_empty() {
-        bail!("link label must not be empty");
+        bail!("link path query must not be empty");
     }
 
     let all_annotations = annotations::list_annotations(&root)?;
-    let mut results: Vec<Value> = Vec::new();
-    let mut orphans: Vec<Value> = Vec::new();
+    let merged = links::merged_link_paths_by_component(&root, &index, &all_annotations);
+    let catalog = links::load_link_catalog(&root).unwrap_or_default();
 
+    let component_by_id: HashMap<&str, &ComponentRecord> = index
+        .components
+        .iter()
+        .map(|c| (c.id.as_str(), c))
+        .collect();
+
+    let mut ann_by_id: HashMap<&str, &annotations::Annotation> = HashMap::new();
     for ann in &all_annotations {
-        if !annotation_matches_link(ann, q) {
-            continue;
-        }
         if let Some(comp) = annotations::resolve_component_for_annotation(&index, ann) {
-            let preview = truncate_preview(&ann.content, 120);
-            let row = if notes {
-                json!({
-                    "component": comp,
-                    "links": ann.links,
-                    "tags": ann.tags,
-                    "annotation": {
-                        "hash_id": ann.hash_id,
-                        "content": ann.content,
-                        "tags": ann.tags,
-                        "links": ann.links,
-                        "created_at": ann.created_at,
-                        "updated_at": ann.updated_at,
-                    }
-                })
-            } else {
-                json!({
-                    "component": comp,
-                    "links": ann.links,
-                    "tags": ann.tags,
-                    "annotation_preview": preview,
-                })
-            };
-            results.push(row);
-        } else {
-            orphans.push(json!({
-                "hash_id": ann.hash_id,
-                "component_name": ann.component_name,
-                "component_type": ann.component_type,
-                "file": ann.file,
-                "language": ann.language,
-                "links": ann.links,
-                "tags": ann.tags,
-                "annotation_preview": truncate_preview(&ann.content, 120),
-            }));
+            ann_by_id.insert(comp.id.as_str(), ann);
+        }
+    }
+
+    let mut path_buckets: HashMap<String, HashSet<String>> = HashMap::new();
+    for (cid, paths) in &merged {
+        for p in paths {
+            if links::path_matches_link_query(p, q) {
+                path_buckets
+                    .entry(p.clone())
+                    .or_default()
+                    .insert(cid.clone());
+            }
+        }
+    }
+
+    let mut sorted_paths: Vec<String> = path_buckets.keys().cloned().collect();
+    sorted_paths = links::sort_paths_for_display(&sorted_paths, &catalog);
+
+    let mut path_groups: Vec<Value> = Vec::new();
+    let mut seen_result_ids: HashSet<String> = HashSet::new();
+    let mut results: Vec<Value> = Vec::new();
+
+    for path in &sorted_paths {
+        let Some(cids) = path_buckets.get(path) else {
+            continue;
+        };
+        let mut comps: Vec<&ComponentRecord> = cids
+            .iter()
+            .filter_map(|id| component_by_id.get(id.as_str()).copied())
+            .collect();
+        comps.sort_by(|a, b| {
+            (
+                a.file.as_str(),
+                a.start_line,
+                a.name.as_str(),
+                a.id.as_str(),
+            )
+                .cmp(&(
+                    b.file.as_str(),
+                    b.start_line,
+                    b.name.as_str(),
+                    b.id.as_str(),
+                ))
+        });
+
+        let group_components: Vec<Value> = comps
+            .iter()
+            .map(|comp| {
+                let mpaths = merged.get(comp.id.as_str()).cloned().unwrap_or_default();
+                json_for_link_result(comp, &mpaths, ann_by_id.get(comp.id.as_str()).copied(), notes)
+            })
+            .collect();
+
+        path_groups.push(json!({
+            "path": path,
+            "depth": link_path_display_depth(path),
+            "components": group_components,
+        }));
+
+        for comp in comps {
+            if seen_result_ids.insert(comp.id.clone()) {
+                let mpaths = merged.get(comp.id.as_str()).cloned().unwrap_or_default();
+                results.push(json_for_link_result(
+                    comp,
+                    &mpaths,
+                    ann_by_id.get(comp.id.as_str()).copied(),
+                    notes,
+                ));
+            }
         }
     }
 
@@ -1108,8 +1322,48 @@ fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
         (fa, la).cmp(&(fb, lb))
     });
 
+    let store = links::load_component_links(&root).unwrap_or_default();
+    let mut orphan_memberships: Vec<Value> = Vec::new();
+    for (cid, paths) in &store.memberships {
+        if component_by_id.contains_key(cid.as_str()) {
+            continue;
+        }
+        if !paths
+            .iter()
+            .any(|p| links::path_matches_link_query(p, q))
+        {
+            continue;
+        }
+        orphan_memberships.push(json!({
+            "kind": "link_store",
+            "component_id": cid,
+            "paths": paths,
+        }));
+    }
+
+    let mut orphans: Vec<Value> = Vec::new();
+    for ann in &all_annotations {
+        if !annotation_links_match_query(ann, q) {
+            continue;
+        }
+        if annotations::resolve_component_for_annotation(&index, ann).is_some() {
+            continue;
+        }
+        orphans.push(json!({
+            "kind": "annotation",
+            "hash_id": ann.hash_id,
+            "component_name": ann.component_name,
+            "component_type": ann.component_type,
+            "file": ann.file,
+            "language": ann.language,
+            "links": ann.links,
+            "tags": ann.tags,
+            "annotation_preview": truncate_preview(&ann.content, 120),
+        }));
+    }
+
     let elapsed = timer.elapsed();
-    let orphan_count = orphans.len();
+    let orphan_count = orphans.len() + orphan_memberships.len();
     Ok(json!({
         "ok": true,
         "command": "link",
@@ -1117,8 +1371,10 @@ fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
         "notes": notes,
         "result_count": results.len(),
         "results": results,
+        "path_groups": path_groups,
         "orphan_count": orphan_count,
         "orphans": orphans,
+        "orphan_memberships": orphan_memberships,
         "elapsed_secs": elapsed.as_secs_f64(),
         "index_staleness": index_staleness
     }))
@@ -1472,6 +1728,11 @@ fn handle_annotate(root: PathBuf, action: AnnotateAction) -> Result<Value> {
             };
 
             annotations::save_annotation(&root, &annotation)?;
+            for link in &annotation.links {
+                if links::validate_link_path(link).is_ok() {
+                    let _ = links::add_membership(&root, &component_id, link);
+                }
+            }
             persist_token_index(&root, &index);
             let elapsed = timer.elapsed();
 
@@ -1741,7 +2002,8 @@ fn summarize_index(index: &IndexData) -> Value {
 fn persist_token_index(root: &std::path::Path, index: &IndexData) {
     let all_annotations = annotations::reconcile_annotations_with_index(root, index)
         .unwrap_or_else(|_| annotations::list_annotations(root).unwrap_or_default());
-    let token_index = search::build_token_index(index, &all_annotations);
+    let link_map = links::merged_link_paths_by_component(root, index, &all_annotations);
+    let token_index = search::build_token_index(index, &all_annotations, &link_map);
     let _ = storage::save_token_index(root, &token_index);
 }
 

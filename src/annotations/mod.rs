@@ -26,7 +26,7 @@ pub struct Annotation {
     pub content: String,
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Cross-component pipeline / topic labels (queried via `lime link <name>`).
+    /// Link paths (`/` segments); merged with `.lime/component_links.json` for `lime link` / search.
     #[serde(default)]
     pub links: Vec<String>,
     pub created_at: String,

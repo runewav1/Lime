@@ -1,563 +1,214 @@
-# Skill: Lime
+---
+name: lime
+description: codebase indexation for most languages; high-level component retrieval, annotation, linking, and more.
+---
 
-Lime is a fast, language-aware codebase index for AI coding agents. It builds and maintains a persistent index of code components (functions, structs, classes, etc.) enabling agents to efficiently search, list, annotate, and traverse dependencies.
+Language-aware codebase index for AI agents. Indexes functions, structs, classes, and more. All commands support `--json` (global) for raw JSON output — always use it.
 
-## Global Flag
+## Quick Start
 
-| Flag | Description |
-|------|-------------|
-| `--json` | Output raw JSON for scripts and agents (use this for all agent interactions) |
-
-## Recommended agent workflows
-
-**Cheap path (low token use):** Start with `lime --json sum` for counts, languages, top annotation link labels, and staleness. Drill into a topic with `lime --json link <label>`, then open specific code with `lime --json show <id>` (and `lime --json deps <id>` when needed).
-
-**Heavy path:** Use `lime --json list <lang> -a` or broad `lime --json search` / `lime --json search --fuzzy` when you need full component lists or name-based discovery. Expect larger JSON payloads.
+```
+lime --json sync                          # build/rebuild full index
+lime --json search run                    # find components named "run"
+lime --json list rust --all               # list all rust components with IDs
+lime --json show fn-61bcc6dabec3f308      # show component source
+lime --json deps fn-61bcc6dabec3f308      # dependency matrix
+```
 
 ## Commands
 
-### lime sync
-
-Build/rebuild the index. Without arguments, scans entire codebase. With file arguments, indexes only those files.
+### sync [files...] [--diagnostics] [-v]
+Rebuild index. No args = full scan. With files = re-index only those.
 
 ```bash
 lime --json sync
-lime --json sync src/main.rs
-lime --json sync src/a.rs src/b.rs
-lime --json sync --diagnostics
-lime --json sync -v
+lime --json sync src/main.rs src/lib.rs
+lime --json sync --diagnostics            # attach static-analyzer faults
+lime --json sync -v                       # verbose breakdown
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--diagnostics` | Run static analyzers and attach fault data to components |
-| `-v, --verbose` | Show detailed output |
-
-**JSON Output:**
-```json
-{
-  "ok": true,
-  "command": "sync",
-  "elapsed_secs": 0.03,
-  "index": {
-    "component_count": 138,
-    "file_count": 8,
-    "languages": ["rust"],
-    "batman_count": 3
-  },
-  "index_staleness": {
-    "stale": false,
-    "last_indexed_commit": "abc123",
-    "current_commit": "abc123"
-  }
-}
-```
-
-### lime add
-
-Add or refresh a single file in the index.
+### add <filepath>
+Add/refresh a single file. Returns `{ok, command:"add", elapsed_secs, request:{filename}, result, index}`.
 
 ```bash
 lime --json add src/auth.rs
 ```
 
-**JSON Output:**
-```json
-{
-  "ok": true,
-  "command": "add",
-  "file": "src/auth.rs",
-  "elapsed_secs": 0.01,
-  "index": { "component_count": 142, "file_count": 9, "languages": ["rust"] }
-}
-```
-
-### lime remove
-
-Remove a file and all its components from the index. Disk untouched.
+### remove <filepath>
+Remove file from index (disk untouched). Returns `{ok, command:"remove", elapsed_secs, removed, index}`.
 
 ```bash
 lime --json remove src/old.rs
 ```
 
-**JSON Output:**
-```json
-{
-  "ok": true,
-  "command": "remove",
-  "file": "src/old.rs",
-  "removed_components": 5,
-  "elapsed_secs": 0.01
-}
-```
-
-### lime search
-
-Search indexed components by name, file path, or ID. Case-insensitive substring match.
+### search [language] [type] <query> [--fuzzy]
+Case-insensitive substring match on names, IDs, file paths.
 
 ```bash
-lime --json search run
-lime --json search rust run
-lime --json search rust fn run
-lime --json search --fuzzy auth
-lime --json search python class Auth
+lime --json search run                    # all languages
+lime --json search rust run               # filter language
+lime --json search rust fn run            # filter language + type
+lime --json search --fuzzy auth           # fuzzy: token + annotation search
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--fuzzy` | Enable fuzzy matching with token-based and annotation search |
+**JSON:** `{ok, command:"search", query, fuzzy, result_count, results:[{id, name, type, file, start_line, language, death_status, match_type?, annotation_preview?}], elapsed_secs}`
 
-**Supported Languages:** rust, javascript, typescript, python, go, zig, c, cpp, swift
+`--fuzzy` adds `match_type`: `exact`, `prefix`, `substring`, `annotation`. Annotation matches include `annotation_preview` (first 80 chars).
 
-**Supported Types:** fn, struct, enum, trait, impl, mod, use, class, function, const, let, var, interface, type, export, def, async def, async, import, from, func
-
-**JSON Output:**
-```json
-{
-  "ok": true,
-  "command": "search",
-  "query": "run",
-  "results": [
-    {
-      "id": "fn-61bcc6dabec3f308",
-      "name": "run",
-      "type": "fn",
-      "file": "src/main.rs",
-      "line": 16,
-      "language": "rust",
-      "batman": false,
-      "match_type": "exact",
-      "annotation_preview": null
-    }
-  ],
-  "elapsed_secs": 0.01
-}
-```
-
-When `--fuzzy` is used, `match_type` can be: `exact`, `prefix`, `substring`, `annotation`. If match came from annotation content, `annotation_preview` contains first 80 chars.
-
-### lime link
-
-List components whose annotations share a **link** label (cross-component topic / pipeline). Set links with `lime annotate add --link <name>`. Matching is case-insensitive.
-
+### list [language] [type] [-a|--all] [--dead] [--fault]
 ```bash
-lime --json link auth
-lime --json link auth --notes
+lime --json list                          # list indexed languages
+lime --json list rust                     # component counts by type
+lime --json list rust -a                  # all components with IDs
+lime --json list rust fn                  # only functions
+lime --json list rust --dead              # dead components only
+lime --json list rust --fault             # faulty components only
+lime --json list rust --dead --fault      # combined filter
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--notes` | Include full annotation markdown per result (default is a short preview only) |
+**JSON modes:** `languages` → `{ok, languages:[...]}` · `language_summary` → `{ok, language, total, dead, faulty, component_counts:{type:count}}` · `language_all` / `language_and_type` → `{ok, language, count, components:[{id, name, type, file, start_line, language, death_status, faults}]}`
 
-**JSON Output:** `results` entries include `component`, `links`, `tags`, and either `annotation_preview` or full `annotation` when `--notes` is set.
-
-### lime list
-
-List indexed languages or components.
-
-```bash
-lime --json list
-lime --json list rust
-lime --json list rust -a
-lime --json list rust fn
-lime --json list rust --dead
-lime --json list rust --fault
-lime --json list rust --dead --fault
-```
-
-| Flag | Description |
-|------|-------------|
-| `-a, --all` | List all components for the language with IDs |
-| `--dead` | Only components marked as dead (batman) |
-| `--fault` | Only components with analyzer faults |
-
-**JSON Output (languages):**
-```json
-{
-  "ok": true,
-  "command": "list",
-  "languages": ["rust", "typescript"]
-}
-```
-
-**JSON Output (language summary):**
-```json
-{
-  "ok": true,
-  "command": "list",
-  "language": "rust",
-  "counts": {
-    "fn": 84,
-    "struct": 12,
-    "enum": 8,
-    "impl": 20,
-    "total": 138
-  }
-}
-```
-
-**JSON Output (all components):**
-```json
-{
-  "ok": true,
-  "command": "list",
-  "language": "rust",
-  "components": [
-    {
-      "id": "fn-61bcc6dabec3f308",
-      "name": "run",
-      "type": "fn",
-      "file": "src/main.rs",
-      "line": 16,
-      "batman": false
-    }
-  ]
-}
-```
-
-### lime show
-
-Show component source code with line numbers and inline diagnostics.
+### show <component_id>
+Source code + line numbers + inline diagnostics + annotation.
 
 ```bash
 lime --json show fn-61bcc6dabec3f308
 ```
 
-**JSON Output:**
-```json
-{
-  "ok": true,
-  "command": "show",
-  "component": {
-    "id": "fn-61bcc6dabec3f308",
-    "name": "run",
-    "type": "fn",
-    "file": "src/main.rs",
-    "line": 16
-  },
-  "source_lines": [
-    { "line": 16, "content": "pub fn run() -> Result<()> {" },
-    { "line": 17, "content": "    let config = Config::load()?;" }
-  ],
-  "diagnostics": [],
-  "annotation": null,
-  "file_changed": false
-}
-```
+**JSON:** `{ok, command:"show", component:{id, language, type, name, file, start_line, end_line, death_status, faults}, file_changed, source_lines:[{line, code, diagnostics:[]}], annotation, index_staleness}`
 
-### lime deps
-
-Show dependency matrix for a component (uses/used-by relationships).
+### deps <component_id> [--depth <n>]
+Dependency matrix (uses / used-by). Default depth from config (usually 2).
 
 ```bash
 lime --json deps fn-61bcc6dabec3f308
 lime --json deps fn-61bcc6dabec3f308 --depth 3
-lime --json deps fn-61bcc6dabec3f308 --depth 0
+lime --json deps fn-61bcc6dabec3f308 --depth 0   # component only; obsolete
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--depth <n>` | Traversal depth (default from config, usually 2). Use 0 for component only |
+**JSON:** `{ok, command:"deps", component, dependency_matrix, elapsed_secs}`
 
-**JSON Output:**
-```json
-{
-  "ok": true,
-  "command": "deps",
-  "component": {
-    "id": "fn-61bcc6dabec3f308",
-    "name": "run",
-    "type": "fn",
-    "batman": false
-  },
-  "depth": 2,
-  "uses": [
-    { "id": "struct-abc123", "name": "Config", "type": "struct", "depth": 1, "batman": false }
-  ],
-  "used_by": [
-    { "id": "fn-def456", "name": "main", "type": "fn", "depth": 1, "batman": false }
-  ]
-}
-```
-
-### lime annotate
-
-Attach semantic annotations to components.
-
-#### lime annotate add
+### annotate {add|show|list|remove}
 
 ```bash
-lime --json annotate add fn-61bcc6dabec3f308 -m "Entry point for CLI execution"
-lime --json annotate add fn-abc123 -m "Auth handler" -t security -t critical
-lime --json annotate add fn-abc123 -m "Login flow" -l auth
-lime --json annotate add fn-abc123 --file docs/notes/fn-abc123.md -l auth
+lime --json annotate add <id> -m "description"        # inline message
+lime --json annotate add <id> --file notes/id.md      # from file
+lime --json annotate add <id> -m "x" -t keep -t api   # with tags
+lime --json annotate add <id> -m "x" -l auth          # with link label
+lime --json annotate show <id>
+lime --json annotate list [language] [type]
+lime --json annotate remove <id>
 ```
 
-| Flag | Description |
-|------|-------------|
-| `-m, --message` | Inline markdown body (mutually exclusive with `--file`) |
-| `--file` | Read annotation body from this path (repo-relative or absolute; mutually exclusive with `-m`) |
-| `-t, --tag` | Tag (repeatable); e.g. `keep`, `public_api`, `entrypoint` |
-| `-l, --link` | Link label (repeatable); group components for `lime link <name>` |
+Flags: `-m/--message` (inline body), `--file` (body from path; exclusive with `-m`), `-t/--tag` (repeatable), `-l/--link` (repeatable link paths; **dual-written** to `.lime/component_links.json` and the annotation file).
 
-Provide **`-m` or `--file`**, or update an **existing** annotation to change only tags/links.
+**JSON:** `{ok, command:"annotate", action, elapsed_secs, annotation:{hash_id, content, tags, links, created_at, updated_at}}` (list → `results:[{component, annotation:{...preview}}]`, remove → `{removed}`)
 
-**JSON Output:**
-```json
-{
-  "ok": true,
-  "command": "annotate",
-  "action": "add",
-  "annotation": {
-    "hash_id": "fn-61bcc6dabec3f308",
-    "content": "Entry point for CLI execution",
-    "tags": [],
-    "links": ["auth"],
-    "created_at": "2026-03-20T05:00:00Z",
-    "updated_at": "2026-03-20T05:00:00Z"
-  }
-}
-```
+### Link paths (naming)
 
-#### lime annotate show
+- **Delimiter:** `/` only. Segments are non-empty; no leading/trailing `/`, no `//`.
+- **Hierarchy:** prefix = ancestry (`auth` is parent of `auth/login`).
+- **Order (default):** Unicode **lexicographic** sort on the full path. Encode timelines with zero-padded segments, e.g. `auth/01-discovery`, `auth/02-design`, or date buckets `auth/2026-03/01-login`.
+- **Matching:** `lime link <query>` matches a path **equal** to `query` or any path **under** `query/` (case-insensitive).
+- **Limits:** path length and count per component are capped (see code: `MAX_LINK_PATH_LEN`, `MAX_PATHS_PER_COMPONENT`).
+
+Optional **`.lime/link_catalog.json`**: map path → `{ title, description, parent_path, sort_key }`. When present, `sort_key` orders paths before lexicographic path (used by `lime links list` and `lime link` grouping).
+
+### links {add|remove|list|compact}
+
+Manage membership in **`.lime/component_links.json`** without editing annotations.
 
 ```bash
-lime --json annotate show fn-61bcc6dabec3f308
+lime --json links add fn-abc123 auth/login
+lime --json links remove fn-abc123 auth/login
+lime --json links list                  # all distinct paths (merged store + annotations)
+lime --json links list auth --tree      # indent by / depth
+lime --json links compact               # strip duplicate link lines from annotations when store already has path
 ```
 
-**JSON Output:**
-```json
-{
-  "ok": true,
-  "command": "annotate",
-  "action": "show",
-  "annotation": {
-    "hash_id": "fn-61bcc6dabec3f308",
-    "content": "Entry point for CLI execution",
-    "tags": [],
-    "links": [],
-    "created_at": "2026-03-20T05:00:00Z",
-    "updated_at": "2026-03-20T05:00:00Z"
-  }
-}
-```
+**JSON:** `{ok, command:"links", action, elapsed_secs, ...}` — `list` adds `paths`, `path_count`, `tree`, `prefix`; `remove` adds `removed`; `compact` adds `annotations_updated`.
 
-#### lime annotate list
+### link <path-or-prefix> [--notes]
+
+List indexed components whose **merged** link paths match the query (link store ∪ annotation `links`). Terminal output groups by path (sorted) with `/`-depth indentation.
 
 ```bash
-lime --json annotate list
-lime --json annotate list rust
-lime --json annotate list rust fn
+lime --json link auth
+lime --json link auth/login
+lime --json link auth --notes             # include full annotation markdown when present
 ```
 
-**JSON Output:**
-```json
-{
-  "ok": true,
-  "command": "annotate",
-  "action": "list",
-  "results": [
-    {
-      "component": { "id": "fn-61bcc6dabec3f308", "name": "run", "type": "fn" },
-      "annotation": {
-        "hash_id": "fn-61bcc6dabec3f308",
-        "preview": "Entry point…",
-        "tags": [],
-        "links": [],
-        "created_at": "2026-03-20T05:00:00Z"
-      }
-    }
-  ]
-}
-```
+**JSON:** `{ok, command:"link", link, notes, result_count, results, path_groups:[{path, depth, components}], orphan_count, orphans:[{kind:"annotation",...}], orphan_memberships:[{kind:"link_store", component_id, paths}], ...}`
 
-#### lime annotate remove
+### sum [--top-links N]
 
-```bash
-lime --json annotate remove fn-61bcc6dabec3f308
-```
+Bounded overview; **`links_top`** counts components per path using the **same merged** membership as `lime link` / search tokens (not annotations alone).
 
-**JSON Output:**
-```json
-{
-  "ok": true,
-  "command": "annotate remove",
-  "component_id": "fn-61bcc6dabec3f308",
-  "removed": true
-}
-```
-
-### lime config
-
-View and modify Lime configuration.
-
-#### lime config show
+### config {show|diagnostics|death-seeds|index}
 
 ```bash
 lime --json config show
+lime --json config diagnostics --enabled true --timeout 60
+lime --json config death-seeds --seed-file "src/main.rs" --seed-name "main" --seed-type "fn"
+lime --json config death-seeds --clear-seed-files   # clear before adding
+lime --json config index --pretty false              # compact JSON writes
 ```
 
-**JSON Output:**
-```json
-{
-  "ok": true,
-  "command": "config show",
-  "config": {
-    "default_dependency_depth": 2,
-    "ignore_patterns": [],
-    "index_path": null,
-    "diagnostics": {
-      "enabled": false,
-      "timeout_secs": 30
-    },
-    "death_seeds": {
-      "seed_files": [],
-      "seed_names": [],
-      "seed_types": []
-    }
-  }
-}
-```
+death-seeds flags: `--seed-file <pattern>`, `--seed-name <name>`, `--seed-type <type>`, `--clear-seed-files`, `--clear-seed-names`, `--clear-seed-types`.
 
-#### lime config index
+## Config (`.lime/lime.json`)
 
-Control whether `index.json` is written pretty-printed (default) or compact (smaller/faster writes on large repos).
+| Key | Default | Description |
+|-----|---------|-------------|
+| `default_dependency_depth` | 2 | Max dep traversal depth |
+| `ignore_patterns` | [] | Extra glob patterns to exclude |
+| `index_storage` | `.lime/index.json` | Index file path |
+| `index_pretty` | true | Pretty-print index JSON |
+| `diagnostics.enabled` | false | Run analyzers on sync |
+| `diagnostics.timeout_secs` | 120 | Per-analyzer timeout |
+| `death_seeds.seed_files` | [] | File patterns (always-alive) |
+| `death_seeds.seed_names` | [] | Component name patterns (always-alive) |
+| `death_seeds.seed_types` | [] | Component types (always-alive) |
 
-```bash
-lime --json config index
-lime --json config index --pretty false
-lime --json config index --pretty true
-```
+Default ignores: `node_modules`, `target`, `.git`, `.lime`, `.lemon`
 
-**JSON Output:** `index_pretty` (current value) and `updated` (whether `--pretty` was applied).
+## Storage
 
-#### lime config diagnostics
+- Index: `.lime/index.json` (persistent; `lime sync` after code changes)
+- Annotations: `.lime/annotations/<type>/<id>.md`
+- **Link membership:** `.lime/component_links.json` (source of truth; unioned with annotation `links` on read)
+- **Optional:** `.lime/link_catalog.json` (titles / `sort_key` overrides per path)
+- Index is line/regex parsed (not AST); treat as approximate for macros/generated code
 
-```bash
-lime --json config diagnostics --enabled true
-lime --json config diagnostics --timeout 60
-lime --json config diagnostics --enabled true --timeout 45
-```
+### Agent workflow (links)
 
-| Flag | Description |
-|------|-------------|
-| `--enabled <true\|false>` | Enable/disable diagnostics during sync |
-| `--timeout <secs>` | Per-analyzer timeout in seconds |
+1. `lime --json sum` → scan `links_top` for hot paths.
+2. `lime --json link <path>` → pull grouped components for that topic.
+3. Prefer `lime --json links add <id> <path>` for membership without touching prose; use `annotate add -l` when you also need a written note (**dual-write** keeps legacy annotation `links` in sync).
+4. After migrating to the store, `lime --json links compact` removes redundant `links` lines from annotation frontmatter.
+5. Re-run `lime sync` if IDs drift; fix **orphan_memberships** (stale IDs in the link store) or re-link components.
 
-**JSON Output:**
-```json
-{
-  "ok": true,
-  "command": "config diagnostics",
-  "diagnostics": {
-    "enabled": true,
-    "timeout_secs": 60
-  }
-}
-```
+## Languages & Types
 
-#### lime config death-seeds
+| Language | Extensions | Types |
+|----------|-----------|-------|
+| rust | .rs | fn, struct, enum, trait, impl, mod, use |
+| javascript | .js, .jsx, .mjs | function, class, const, let, var, export |
+| typescript | .ts, .tsx | function, class, interface, type, const, let, var, export |
+| python | .py | def, async def, class, import, from |
+| go | .go | func, type, struct, interface, const, var |
+| zig | .zig | fn, struct, enum, const |
+| c | .c, .h | function, struct, enum, typedef |
+| cpp | .cpp, .hpp, .cc, .cxx | function, class, struct, enum, typedef |
 
-Configure seed patterns for dead-code detection (components matching seeds are always considered alive).
+## Errors
 
-```bash
-lime --json config death-seeds --seed-file "src/main.rs"
-lime --json config death-seeds --seed-name "main"
-lime --json config death-seeds --seed-type "fn"
-lime --json config death-seeds --clear-seed-files
-lime --json config death-seeds --clear-seed-names
-lime --json config death-seeds --clear-seed-types
-```
+All errors: `{"ok":false, "command":"<cmd>", "error":"<message>"}`
 
-| Flag | Description |
-|------|-------------|
-| `--seed-file <pattern>` | Add file path pattern as alive root |
-| `--seed-name <name>` | Add component name pattern as alive root |
-| `--seed-type <type>` | Add component type as alive root |
-| `--clear-seed-files` | Clear all seed file patterns |
-| `--clear-seed-names` | Clear all seed name patterns |
-| `--clear-seed-types` | Clear all seed type patterns |
+Usage Scenarios:
+'lime sync' for codebase indexation
+'lime list -a --json' to retrieve all components
+'lime show {componentID}' to show the component content, attached annotations for context
+'lime link {path-or-prefix}' — components via merged link store + annotations; `lime links add|list` for CRUD on `.lime/component_links.json`
 
-**JSON Output:**
-```json
-{
-  "ok": true,
-  "command": "config death-seeds",
-  "death_seeds": {
-    "seed_files": ["src/main.rs"],
-    "seed_names": ["main", "run"],
-    "seed_types": ["fn"]
-  }
-}
-```
 
-## Configuration
-
-Lime reads `.lime/lime.json` for settings:
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `default_dependency_depth` | int | 2 | Max depth for dependency traversal |
-| `ignore_patterns` | array | [] | Additional patterns to exclude from indexing |
-| `index_storage` | string | `.lime/index.json` | Relative or absolute path to index JSON |
-| `index_pretty` | bool | true | Pretty-print `index.json`; set `false` for compact JSON |
-| `diagnostics.enabled` | bool | false | Run static analyzers during sync |
-| `diagnostics.timeout_secs` | int | 120 | Per-analyzer timeout |
-| `death_seeds.seed_files` | array | [] | File path patterns (always-alive roots) |
-| `death_seeds.seed_names` | array | [] | Component name patterns (always-alive roots) |
-| `death_seeds.seed_types` | array | [] | Component types (always-alive roots) |
-
-**Default Ignore Patterns:** node_modules, target, .git, .lime, .lemon
-
-## Index Storage
-
-- Index stored at `.lime/index.json` (or `index_storage` in config)
-- Annotations stored at `.lime/annotations/<type>/<id>.md`
-- Index is persistent; use `lime sync` after code changes
-- Use `lime sync --diagnostics` to attach static analysis data
-
-### Operational limits (agents)
-
-- **Full index load:** Most commands read and parse the entire `index.json` into memory.
-- **Regex parsing:** Components are extracted with line/regex heuristics, not full language ASTs; treat the index as approximate for edge cases (macros, generated code, unusual syntax).
-- **Annotation reconcile:** After sync, annotations may be rewritten to match current component IDs; frequent `annotate` plus token index rebuild can add I/O on large annotation sets.
-
-## Supported Languages
-
-| Language | File Extensions |
-|----------|-----------------|
-| rust | .rs |
-| javascript | .js, .jsx, .mjs |
-| typescript | .ts, .tsx |
-| python | .py |
-| go | .go |
-| zig | .zig |
-| c | .c, .h |
-| cpp | .cpp, .hpp, .cc, .cxx |
-| swift | .swift |
-
-## Component Types by Language
-
-| Language | Types |
-|----------|-------|
-| rust | fn, struct, enum, trait, impl, mod, use |
-| javascript | function, class, const, let, var, export |
-| typescript | function, class, interface, type, const, let, var, export |
-| python | def, async def, class, import, from |
-| go | func, type, struct, interface, const, var |
-| zig | fn, struct, enum, const |
-| c | function, struct, enum, typedef |
-| cpp | function, class, struct, enum, typedef |
-| swift | struct, class, enum, protocol, actor, extension, func, init, deinit, import, typealias, subscript |
-
-## Error Handling
-
-All commands return `"ok": false` on error with an `"error"` field:
-
-```json
-{
-  "ok": false,
-  "command": "show",
-  "error": "Component not found: fn-invalid123"
-}
-```
