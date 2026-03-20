@@ -450,6 +450,10 @@ fn render_list_components(v: &Value, label: &str, s: &Style) -> String {
 
     if let Some(components) = v.get("components").and_then(Value::as_array) {
         if !components.is_empty() {
+            let term_w = terminal_width();
+            let (max_id_len, _max_line, max_marker) = list_precompute_layout(components);
+            let colon_col = list_colon_column(term_w, max_id_len, max_marker);
+
             let mut idx = 0usize;
             let mut first_file = true;
             while idx < components.len() {
@@ -460,50 +464,47 @@ fn render_list_components(v: &Value, label: &str, s: &Style) -> String {
                 }
                 let chunk = &components[idx..end];
 
-                let mut plain_labels: Vec<String> = Vec::with_capacity(chunk.len());
-                let mut styled_labels: Vec<String> = Vec::with_capacity(chunk.len());
-                let mut depths: Vec<usize> = Vec::with_capacity(chunk.len());
-
-                for c in chunk {
-                    let dp = str_val(c, "display_path");
-                    let depth = list_nesting_depth_from_display_path(&dp, &language);
-                    depths.push(depth);
-                    // Top-level: short `name`; nested: full qualified `display_path`.
-                    let label_core_raw = if depth == 0 {
-                        str_val(c, "name")
-                    } else {
-                        dp
-                    };
-                    let label_core = truncate_list_component_name(&label_core_raw);
-                    if show_type {
-                        let ctype = str_val(c, "type");
-                        // Prefix `(type)` so the ID column stays stable; name truncated separately.
-                        plain_labels.push(format!("({ctype}) {label_core}"));
-                        styled_labels.push(format!("({}) {}", s.cyan(&ctype), label_core));
-                    } else {
-                        plain_labels.push(label_core.clone());
-                        styled_labels.push(label_core);
-                    }
-                }
-
-                let max_label = plain_labels.iter().map(|l| l.len()).max().unwrap_or(0);
-
                 if !first_file {
                     let _ = writeln!(out);
                 }
                 first_file = false;
                 let _ = writeln!(out, "  {}", s.bold(&file));
 
-                for (i, component) in chunk.iter().enumerate() {
-                    let depth = depths[i];
+                for component in chunk {
+                    let dp = str_val(component, "display_path");
+                    let depth = list_nesting_depth_from_display_path(&dp, &language);
                     let base_indent = 4usize;
                     let extra = depth.saturating_mul(2);
                     let indent = base_indent + extra;
 
+                    let label_slot = list_label_slot_width(indent, colon_col);
+                    let label_core_raw = if depth == 0 {
+                        str_val(component, "name")
+                    } else {
+                        dp
+                    };
+
+                    let (plain_label, styled_label) = if show_type {
+                        let ctype = str_val(component, "type");
+                        let prefix_plain = format!("({ctype}) ");
+                        let prefix_w = prefix_plain.chars().count();
+                        let name_budget = label_slot.saturating_sub(prefix_w).max(1);
+                        let name_part = truncate_chars_ellipsis(&label_core_raw, name_budget);
+                        let plain = format!("{prefix_plain}{name_part}");
+                        let styled = format!("({}) {}", s.cyan(&ctype), name_part);
+                        (plain, styled)
+                    } else {
+                        let plain = truncate_chars_ellipsis(&label_core_raw, label_slot);
+                        (plain.clone(), plain)
+                    };
+
+                    // Pad using plain char count (styled adds ANSI; same visible length as plain).
+                    let pad = label_slot.saturating_sub(plain_label.chars().count());
+                    let padded_styled = format!("{styled_label}{}", " ".repeat(pad));
+
                     let start = num_val(component, "start_line");
                     let id = str_val(component, "id");
                     let batman = bool_val(component, "batman");
-                    let padded = pad_styled(&styled_labels[i], plain_labels[i].len(), max_label);
                     let batman_marker = if batman {
                         format!(" {}", s.bold_red("[dead]"))
                     } else {
@@ -521,12 +522,21 @@ fn render_list_components(v: &Value, label: &str, s: &Style) -> String {
                     let fault_marker = fault_total
                         .map(|n| format!(" {}", s.bold_red(&format!("[{n} fault{}]", plural(n)))))
                         .unwrap_or_default();
+
+                    let id_padded = pad_plain_right(&id, max_id_len);
+                    let id_dim = s.dim(&id_padded);
+                    let line_part = format!(
+                        ":{:>lw$}",
+                        start,
+                        lw = LIST_LINE_NUMBER_COL_WIDTH
+                    );
                     let _ = writeln!(
                         out,
-                        "{}{}  :{start}  {}{}{}",
+                        "{}{}  {}  {}{}{}",
                         " ".repeat(indent),
-                        padded,
-                        s.dim(&id),
+                        padded_styled,
+                        line_part,
+                        id_dim,
                         batman_marker,
                         fault_marker
                     );
@@ -621,6 +631,7 @@ fn render_show(v: &Value, s: &Style) -> String {
             "c" => "c",
             "cpp" => "cpp",
             "zig" => "zig",
+            "swift" => "swift",
             _ => "txt",
         };
         let syntax = ss
@@ -1082,19 +1093,90 @@ fn display_name(raw: &str) -> String {
     }
 }
 
-/// Max visible characters for the component **name** segment in `lime list` rows (not counting `(type)` prefix).
-/// Truncation keeps the line column aligned with the dim ID column.
-const LIST_COMPONENT_NAME_MAX_CHARS: usize = 48;
+/// Fixed width for the `start_line` field after `:` (right-aligned digits).
+const LIST_LINE_NUMBER_COL_WIDTH: usize = 6;
 
-fn truncate_list_component_name(raw: &str) -> String {
-    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(48, 256)
+}
+
+/// Plain-text length of optional `[dead]` / `[N faults]` suffix for a row.
+fn list_marker_plain_len(c: &Value) -> usize {
+    let mut n = 0usize;
+    if bool_val(c, "batman") {
+        n += 6; // " [dead]"
+    }
+    let fault_total = c.get("faults").and_then(|f| {
+        let e = f.get("errors").and_then(Value::as_u64).unwrap_or(0);
+        let w = f.get("warnings").and_then(Value::as_u64).unwrap_or(0);
+        let note = f.get("notes").and_then(Value::as_u64).unwrap_or(0);
+        let t = e + w + note;
+        if t > 0 { Some(t) } else { None }
+    });
+    if let Some(t) = fault_total {
+        n += 2 + format!("[{t} fault{}]", plural(t)).len();
+    }
+    n
+}
+
+fn list_precompute_layout(components: &[Value]) -> (usize, u64, usize) {
+    let mut max_id_len = 0usize;
+    let mut max_line = 0u64;
+    let mut max_marker = 0usize;
+    for c in components {
+        max_id_len = max_id_len.max(str_val(c, "id").chars().count());
+        max_line = max_line.max(num_val(c, "start_line"));
+        max_marker = max_marker.max(list_marker_plain_len(c));
+    }
+    (max_id_len, max_line, max_marker)
+}
+
+/// Width of the fixed region **starting at `:`** through end-of-line (`:` + line + gap + id + markers).
+fn list_width_after_colon(max_id_len: usize, max_marker: usize) -> usize {
+    // `:` + line_digits + `  ` + id + markers
+    1 + LIST_LINE_NUMBER_COL_WIDTH + 2 + max_id_len + max_marker
+}
+
+/// 0-based column index of the `:` that follows the label and two spaces (`  `).
+fn list_colon_column(term_w: usize, max_id_len: usize, max_marker: usize) -> usize {
+    term_w.saturating_sub(list_width_after_colon(max_id_len, max_marker))
+}
+
+/// Visible width available for the label (after indent, before `  :`).
+fn list_label_slot_width(indent_cols: usize, colon_col: usize) -> usize {
+    // indent + label + "  " + ":" ... => label ends at colon_col - 2
+    colon_col.saturating_sub(indent_cols).saturating_sub(2).max(1)
+}
+
+fn collapse_whitespace(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Truncate to at most `max_chars` Unicode scalars; if truncated, append `...`.
+fn truncate_chars_ellipsis(raw: &str, max_chars: usize) -> String {
+    let collapsed = collapse_whitespace(raw);
     let count = collapsed.chars().count();
-    if count <= LIST_COMPONENT_NAME_MAX_CHARS {
+    if count <= max_chars {
         return collapsed;
     }
-    let keep = LIST_COMPONENT_NAME_MAX_CHARS.saturating_sub(3);
+    if max_chars <= 3 {
+        return "...".chars().take(max_chars).collect();
+    }
+    let keep = max_chars.saturating_sub(3);
     let truncated: String = collapsed.chars().take(keep).collect();
     format!("{truncated}...")
+}
+
+fn pad_plain_right(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len >= width {
+        return text.to_string();
+    }
+    format!("{}{}", text, " ".repeat(width - len))
 }
 
 /// Prefer `display_path` (nested qualified name) when present; otherwise bare `name`.
@@ -1113,7 +1195,7 @@ fn list_nesting_depth_from_display_path(display_path: &str, language: &str) -> u
         return 0;
     }
     let sep = match language {
-        "python" | "javascript" | "typescript" | "go" => ".",
+        "python" | "javascript" | "typescript" | "go" | "swift" => ".",
         _ => "::",
     };
     display_path.matches(sep).count()

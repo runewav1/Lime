@@ -167,6 +167,52 @@ static GO_CONST_RE: LazyLock<Regex> =
 static GO_VAR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^\s*var\s+([A-Za-z_][A-Za-z0-9_]*)\b").unwrap());
 
+// ---- Swift ----
+
+/// `struct` / `class` / `enum` / `protocol` / `actor` with optional attributes and access control.
+static SWIFT_TYPE_DECL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^\s*(?:@(?:[A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?\s+)*(?:open|public|internal|fileprivate|private|package)?\s*(?:final\s+)?(struct|class|enum|protocol|actor)\s+([A-Za-z_][A-Za-z0-9_]*)",
+    )
+    .unwrap()
+});
+static SWIFT_EXTENSION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^\s*(?:open|public|internal|fileprivate|private|package)?\s*extension\s+([A-Za-z_][A-Za-z0-9_.]*)",
+    )
+    .unwrap()
+});
+static SWIFT_FUNC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^\s*(?:@(?:[A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?\s+)*(?:open|public|internal|fileprivate|private|package)?\s*(?:static\s+|class\s+|mutating\s+|nonisolated\s+|override\s+)*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+    )
+    .unwrap()
+});
+static SWIFT_INIT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^\s*(?:@(?:[A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?\s+)*(?:open|public|internal|fileprivate|private|package)?\s*(?:required\s+|convenience\s+)?init\s*\(",
+    )
+    .unwrap()
+});
+static SWIFT_DEINIT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^\s*(?:@(?:[A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?\s+)*(?:open|public|internal|fileprivate|private|package)?\s*deinit\b",
+    )
+    .unwrap()
+});
+static SWIFT_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^\s*import\s+(?:typealias\s+|struct\s+|enum\s+|class\s+|protocol\s+)?([A-Za-z_][A-Za-z0-9_.]*)",
+    )
+    .unwrap()
+});
+static SWIFT_TYPEALIAS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^\s*(?:open|public|internal|fileprivate|private|package)?\s*typealias\s+([A-Za-z_][A-Za-z0-9_]*)",
+    )
+    .unwrap()
+});
+
 /// Detects the language key used by Lime for a file extension.
 pub fn detect_language(extension: &str) -> Option<&'static str> {
     match extension.to_ascii_lowercase().as_str() {
@@ -175,6 +221,7 @@ pub fn detect_language(extension: &str) -> Option<&'static str> {
         "ts" | "tsx" => Some("typescript"),
         "py" => Some("python"),
         "go" => Some("go"),
+        "swift" => Some("swift"),
         "zig" => Some("zig"),
         "c" | "h" => Some("c"),
         "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Some("cpp"),
@@ -191,6 +238,7 @@ pub fn parse_components(language: &str, content: &str) -> Vec<ParsedComponent> {
         "javascript" | "typescript" => parse_js_ts(content, language, &mut components),
         "python" => parse_python(content, &mut components),
         "go" => parse_go(content, &mut components),
+        "swift" => parse_swift(content, &mut components),
         "zig" => parse_zig(content, &mut components),
         "c" => parse_c(content, &mut components),
         "cpp" => parse_cpp(content, &mut components),
@@ -287,6 +335,37 @@ fn parse_go(content: &str, out: &mut Vec<ParsedComponent>) {
                 name_match.as_str().trim(),
                 matched.start(),
             ));
+        }
+    }
+}
+
+fn parse_swift(content: &str, out: &mut Vec<ParsedComponent>) {
+    for captures in SWIFT_TYPE_DECL_RE.captures_iter(content) {
+        if let (Some(matched), Some(kind), Some(name)) =
+            (captures.get(0), captures.get(1), captures.get(2))
+        {
+            out.push(ParsedComponent::new(
+                kind.as_str(),
+                name.as_str().trim(),
+                matched.start(),
+            ));
+        }
+    }
+
+    collect_single_group(content, &SWIFT_EXTENSION_RE, "extension", out);
+    collect_single_group(content, &SWIFT_IMPORT_RE, "import", out);
+    collect_single_group(content, &SWIFT_TYPEALIAS_RE, "typealias", out);
+    collect_single_group(content, &SWIFT_FUNC_RE, "func", out);
+
+    for captures in SWIFT_INIT_RE.captures_iter(content) {
+        if let Some(matched) = captures.get(0) {
+            out.push(ParsedComponent::new("init", "init", matched.start()));
+        }
+    }
+
+    for captures in SWIFT_DEINIT_RE.captures_iter(content) {
+        if let Some(matched) = captures.get(0) {
+            out.push(ParsedComponent::new("deinit", "deinit", matched.start()));
         }
     }
 }
@@ -560,6 +639,7 @@ mod tests {
         assert_eq!(detect_language("go"), Some("go"));
         assert_eq!(detect_language("js"), Some("javascript"));
         assert_eq!(detect_language("ts"), Some("typescript"));
+        assert_eq!(detect_language("swift"), Some("swift"));
     }
 
     #[test]
@@ -919,6 +999,96 @@ type Callback func(error)
             .collect();
         assert!(type_aliases.contains(&"Duration"), "expected type Duration, got: {type_aliases:?}");
         assert!(type_aliases.contains(&"Callback"), "expected type Callback, got: {type_aliases:?}");
+    }
+
+    // ---- Swift parsing ----
+
+    #[test]
+    fn swift_types_protocols_extensions() {
+        let src = r#"
+public struct Point {
+    var x: Int
+}
+
+final class ViewModel {
+}
+
+protocol DataSource {
+}
+
+actor Counter {
+}
+
+extension Array where Element == Int {
+    func sum() -> Int { 0 }
+}
+"#;
+        let components = parse_components("swift", src);
+        let types: Vec<(&str, &str)> = components
+            .iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(types.contains(&("struct", "Point")), "expected struct Point, got: {types:?}");
+        assert!(types.contains(&("class", "ViewModel")), "expected class ViewModel, got: {types:?}");
+        assert!(types.contains(&("protocol", "DataSource")), "expected protocol DataSource, got: {types:?}");
+        assert!(types.contains(&("actor", "Counter")), "expected actor Counter, got: {types:?}");
+        assert!(
+            types.contains(&("extension", "Array")),
+            "expected extension Array, got: {types:?}"
+        );
+    }
+
+    #[test]
+    fn swift_functions_inits_imports() {
+        let src = r#"
+import Foundation
+
+typealias Handler = () -> Void
+
+struct Box {
+    init(value: Int) {
+    }
+
+    deinit {
+    }
+
+    func describe() -> String {
+        ""
+    }
+
+    static func make() -> Box {
+        Box(value: 0)
+    }
+}
+"#;
+        let components = parse_components("swift", src);
+        let types: Vec<(&str, &str)> = components
+            .iter()
+            .map(|c| (c.component_type.as_str(), c.name.as_str()))
+            .collect();
+        assert!(
+            types.contains(&("import", "Foundation")),
+            "expected import Foundation, got: {types:?}"
+        );
+        assert!(
+            types.contains(&("typealias", "Handler")),
+            "expected typealias Handler, got: {types:?}"
+        );
+        assert!(
+            types.iter().filter(|(t, _)| *t == "init").count() >= 1,
+            "expected init, got: {types:?}"
+        );
+        assert!(
+            types.iter().filter(|(t, _)| *t == "deinit").count() >= 1,
+            "expected deinit, got: {types:?}"
+        );
+        let funcs: Vec<&str> = components
+            .iter()
+            .filter(|c| c.component_type == "func")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(funcs.contains(&"describe"), "expected func describe, got: {funcs:?}");
+        assert!(funcs.contains(&"make"), "expected static func make, got: {funcs:?}");
     }
 
     // ---- Zig parsing ----

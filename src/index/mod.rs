@@ -533,7 +533,7 @@ fn remove_path_from_index(index: &mut IndexData, relative_path: &str) -> bool {
 /// Separator between parent and child names in [`ComponentRecord::display_path`].
 fn display_path_separator(language: &str) -> &'static str {
     match language {
-        "python" | "javascript" | "typescript" | "go" => ".",
+        "python" | "javascript" | "typescript" | "go" | "swift" => ".",
         _ => "::",
     }
 }

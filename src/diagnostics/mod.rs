@@ -131,6 +131,13 @@ fn analyzer_specs() -> Vec<AnalyzerSpec> {
             build_args: |_root| vec!["build".into()],
             parse_output: parse_colon_diagnostics,
         },
+        AnalyzerSpec {
+            language: "swift",
+            tool_name: "swift-build",
+            binary: "swift",
+            build_args: |_root| vec!["build".into()],
+            parse_output: parse_colon_diagnostics,
+        },
     ]
 }
 
