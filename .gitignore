@@ -3,3 +3,5 @@ target/
 .lemon/
 cargo.lock
 Lime.md
+SKILL.md
+.cursor/

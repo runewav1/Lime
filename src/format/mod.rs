@@ -449,63 +449,91 @@ fn render_list_components(v: &Value, label: &str, s: &Style) -> String {
     }
 
     if let Some(components) = v.get("components").and_then(Value::as_array) {
-        let mut plain_labels: Vec<String> = Vec::with_capacity(components.len());
-        let mut styled_labels: Vec<String> = Vec::with_capacity(components.len());
+        if !components.is_empty() {
+            let mut idx = 0usize;
+            let mut first_file = true;
+            while idx < components.len() {
+                let file = str_val(&components[idx], "file");
+                let mut end = idx + 1;
+                while end < components.len() && str_val(&components[end], "file") == file {
+                    end += 1;
+                }
+                let chunk = &components[idx..end];
 
-        for c in components {
-            let name = display_name(&str_val(c, "name"));
-            if show_type {
-                let ctype = str_val(c, "type");
-                plain_labels.push(format!("{name} ({ctype})"));
-                styled_labels.push(format!("{name} ({})", s.cyan(&ctype)));
-            } else {
-                plain_labels.push(name.clone());
-                styled_labels.push(name);
-            }
-        }
+                let mut plain_labels: Vec<String> = Vec::with_capacity(chunk.len());
+                let mut styled_labels: Vec<String> = Vec::with_capacity(chunk.len());
+                let mut depths: Vec<usize> = Vec::with_capacity(chunk.len());
 
-        let max_label = plain_labels.iter().map(|l| l.len()).max().unwrap_or(0);
-        let mut current_file = String::new();
+                for c in chunk {
+                    let dp = str_val(c, "display_path");
+                    let depth = list_nesting_depth_from_display_path(&dp, &language);
+                    depths.push(depth);
+                    // Top-level: short `name`; nested: full qualified `display_path`.
+                    let label_core_raw = if depth == 0 {
+                        str_val(c, "name")
+                    } else {
+                        dp
+                    };
+                    let label_core = truncate_list_component_name(&label_core_raw);
+                    if show_type {
+                        let ctype = str_val(c, "type");
+                        // Prefix `(type)` so the ID column stays stable; name truncated separately.
+                        plain_labels.push(format!("({ctype}) {label_core}"));
+                        styled_labels.push(format!("({}) {}", s.cyan(&ctype), label_core));
+                    } else {
+                        plain_labels.push(label_core.clone());
+                        styled_labels.push(label_core);
+                    }
+                }
 
-        for (i, component) in components.iter().enumerate() {
-            let file = str_val(component, "file");
+                let max_label = plain_labels.iter().map(|l| l.len()).max().unwrap_or(0);
 
-            if file != current_file {
-                if !current_file.is_empty() {
+                if !first_file {
                     let _ = writeln!(out);
                 }
+                first_file = false;
                 let _ = writeln!(out, "  {}", s.bold(&file));
-                current_file = file;
-            }
 
-            let start = num_val(component, "start_line");
-            let id = str_val(component, "id");
-            let batman = bool_val(component, "batman");
-            let padded = pad_styled(&styled_labels[i], plain_labels[i].len(), max_label);
-            let batman_marker = if batman {
-                format!(" {}", s.bold_red("[dead]"))
-            } else {
-                String::new()
-            };
-            let fault_total = component
-                .get("faults")
-                .and_then(|f| {
-                    let e = f.get("errors").and_then(Value::as_u64).unwrap_or(0);
-                    let w = f.get("warnings").and_then(Value::as_u64).unwrap_or(0);
-                    let n = f.get("notes").and_then(Value::as_u64).unwrap_or(0);
-                    let t = e + w + n;
-                    if t > 0 { Some(t) } else { None }
-                });
-            let fault_marker = fault_total
-                .map(|n| format!(" {}", s.bold_red(&format!("[{n} fault{}]", plural(n)))))
-                .unwrap_or_default();
-            let _ = writeln!(
-                out,
-                "    {padded}  :{start}  {}{}{}",
-                s.dim(&id),
-                batman_marker,
-                fault_marker
-            );
+                for (i, component) in chunk.iter().enumerate() {
+                    let depth = depths[i];
+                    let base_indent = 4usize;
+                    let extra = depth.saturating_mul(2);
+                    let indent = base_indent + extra;
+
+                    let start = num_val(component, "start_line");
+                    let id = str_val(component, "id");
+                    let batman = bool_val(component, "batman");
+                    let padded = pad_styled(&styled_labels[i], plain_labels[i].len(), max_label);
+                    let batman_marker = if batman {
+                        format!(" {}", s.bold_red("[dead]"))
+                    } else {
+                        String::new()
+                    };
+                    let fault_total = component
+                        .get("faults")
+                        .and_then(|f| {
+                            let e = f.get("errors").and_then(Value::as_u64).unwrap_or(0);
+                            let w = f.get("warnings").and_then(Value::as_u64).unwrap_or(0);
+                            let n = f.get("notes").and_then(Value::as_u64).unwrap_or(0);
+                            let t = e + w + n;
+                            if t > 0 { Some(t) } else { None }
+                        });
+                    let fault_marker = fault_total
+                        .map(|n| format!(" {}", s.bold_red(&format!("[{n} fault{}]", plural(n)))))
+                        .unwrap_or_default();
+                    let _ = writeln!(
+                        out,
+                        "{}{}  :{start}  {}{}{}",
+                        " ".repeat(indent),
+                        padded,
+                        s.dim(&id),
+                        batman_marker,
+                        fault_marker
+                    );
+                }
+
+                idx = end;
+            }
         }
     }
 
@@ -527,10 +555,11 @@ fn render_list_components(v: &Value, label: &str, s: &Style) -> String {
 
 fn render_show(v: &Value, s: &Style) -> String {
     let mut out = String::new();
+    out.push('\n');
     write_staleness_banner(&mut out, v, s);
 
     if let Some(component) = v.get("component") {
-        let name = display_name(&str_val(component, "name"));
+        let name = component_label_for_display(component);
         let ctype = str_val(component, "type");
         let file = str_val(component, "file");
         let start = num_val(component, "start_line");
@@ -670,6 +699,7 @@ fn render_show(v: &Value, s: &Style) -> String {
         }
     }
 
+    out.push('\n');
     out
 }
 
@@ -1050,6 +1080,43 @@ fn display_name(raw: &str) -> String {
     } else {
         collapsed
     }
+}
+
+/// Max visible characters for the component **name** segment in `lime list` rows (not counting `(type)` prefix).
+/// Truncation keeps the line column aligned with the dim ID column.
+const LIST_COMPONENT_NAME_MAX_CHARS: usize = 48;
+
+fn truncate_list_component_name(raw: &str) -> String {
+    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = collapsed.chars().count();
+    if count <= LIST_COMPONENT_NAME_MAX_CHARS {
+        return collapsed;
+    }
+    let keep = LIST_COMPONENT_NAME_MAX_CHARS.saturating_sub(3);
+    let truncated: String = collapsed.chars().take(keep).collect();
+    format!("{truncated}...")
+}
+
+/// Prefer `display_path` (nested qualified name) when present; otherwise bare `name`.
+fn component_label_for_display(c: &Value) -> String {
+    let dp = str_val(c, "display_path");
+    if !dp.is_empty() {
+        display_name(&dp)
+    } else {
+        display_name(&str_val(c, "name"))
+    }
+}
+
+/// How many levels deep a component is nested in its file (0 = top-level). Matches index `display_path` rules.
+fn list_nesting_depth_from_display_path(display_path: &str, language: &str) -> usize {
+    if display_path.is_empty() {
+        return 0;
+    }
+    let sep = match language {
+        "python" | "javascript" | "typescript" | "go" => ".",
+        _ => "::",
+    };
+    display_path.matches(sep).count()
 }
 
 fn plural(count: u64) -> &'static str {

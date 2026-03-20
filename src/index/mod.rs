@@ -141,6 +141,9 @@ pub struct ComponentRecord {
     /// Aggregated static-analysis faults (populated during sync with --diagnostics).
     #[serde(default)]
     pub faults: ComponentFaults,
+    /// Qualified label for list/show only (e.g. `outer::inner`). Empty when not nested under another component.
+    #[serde(default)]
+    pub display_path: String,
 }
 
 /// Result metadata for partial file updates.
@@ -434,10 +437,15 @@ fn build_indexed_file(
     let relative = relative_from_path(root, file_path)?;
     let parsed_components = parse_components(language, &content);
 
+    let display_paths = compute_display_paths(language, &content, &parsed_components);
     let component_ids = assign_component_ids(language, &relative, &parsed_components);
     let mut component_records = Vec::with_capacity(parsed_components.len());
 
-    for (component, id) in parsed_components.into_iter().zip(component_ids.iter().cloned()) {
+    for ((component, id), display_path) in parsed_components
+        .into_iter()
+        .zip(component_ids.iter().cloned())
+        .zip(display_paths.into_iter())
+    {
         component_records.push(ComponentRecord {
             id,
             language: language.to_string(),
@@ -452,6 +460,7 @@ fn build_indexed_file(
             death_status: DeathStatus::Alive,
             death_evidence: DeathEvidence::default(),
             faults: ComponentFaults::default(),
+            display_path,
         });
     }
 
@@ -519,6 +528,102 @@ fn remove_path_from_index(index: &mut IndexData, relative_path: &str) -> bool {
         .components
         .retain(|component| component.file != relative_path);
     removed || original_component_len != index.components.len()
+}
+
+/// Separator between parent and child names in [`ComponentRecord::display_path`].
+fn display_path_separator(language: &str) -> &'static str {
+    match language {
+        "python" | "javascript" | "typescript" | "go" => ".",
+        _ => "::",
+    }
+}
+
+fn leading_indent_width(line: &str) -> usize {
+    let mut n = 0usize;
+    for c in line.chars() {
+        match c {
+            ' ' => n += 1,
+            '\t' => n += 4,
+            _ => break,
+        }
+    }
+    n
+}
+
+/// Indentation of the source line where the component starts (1-indexed line).
+fn indent_at_start_line(content: &str, start_line: usize) -> usize {
+    let Some(line) = content.lines().nth(start_line.saturating_sub(1)) else {
+        return 0;
+    };
+    leading_indent_width(line)
+}
+
+/// Closest syntactic parent: a component that starts earlier on a line with **strictly smaller**
+/// indentation than this symbol. Uses leading whitespace (space/tab) so nested `fn`, class methods,
+/// and inner blocks are recognized even when line-range end detection is imperfect.
+fn immediate_parent_index(parsed: &[ParsedComponent], indents: &[usize], i: usize) -> Option<usize> {
+    let inner_indent = indents[i];
+    let mut best: Option<usize> = None;
+    for j in 0..parsed.len() {
+        if j == i {
+            continue;
+        }
+        if parsed[j].start_line >= parsed[i].start_line {
+            continue;
+        }
+        if indents[j] >= inner_indent {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some(b) => {
+                parsed[j].start_line > parsed[b].start_line
+                    || (parsed[j].start_line == parsed[b].start_line
+                        && parsed[j].start_byte_offset() > parsed[b].start_byte_offset())
+            }
+        };
+        if better {
+            best = Some(j);
+        }
+    }
+    best
+}
+
+fn compute_display_paths(language: &str, content: &str, parsed: &[ParsedComponent]) -> Vec<String> {
+    let sep = display_path_separator(language);
+    let indents: Vec<usize> = parsed
+        .iter()
+        .map(|p| indent_at_start_line(content, p.start_line))
+        .collect();
+    let mut out = vec![String::new(); parsed.len()];
+    if parsed.is_empty() {
+        return out;
+    }
+    for (i, slot) in out.iter_mut().enumerate() {
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = i;
+        let mut guard = 0usize;
+        loop {
+            parts.insert(0, parsed[cur].name.clone());
+            let Some(p) = immediate_parent_index(parsed, &indents, cur) else {
+                break;
+            };
+            if p == cur {
+                break;
+            }
+            cur = p;
+            guard += 1;
+            if guard > parsed.len() {
+                break;
+            }
+        }
+        *slot = if parts.len() <= 1 {
+            String::new()
+        } else {
+            parts.join(sep)
+        };
+    }
+    out
 }
 
 /// Assigns stable component IDs for one source file.
@@ -692,5 +797,39 @@ mod component_id_tests {
         assert_eq!(parsed.len(), 2);
         let ids = assign_component_ids("rust", "src/b.rs", &parsed);
         assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn display_path_nested_rust_functions() {
+        let src = "fn outer() {\n    fn inner() {}\n}\n";
+        let parsed = parse_components("rust", src);
+        assert!(
+            parsed.iter().any(|p| p.name == "outer"),
+            "expected outer: {parsed:?}"
+        );
+        assert!(
+            parsed.iter().any(|p| p.name == "inner"),
+            "expected inner: {parsed:?}"
+        );
+        let paths = compute_display_paths("rust", src, &parsed);
+        for (p, path) in parsed.iter().zip(paths.iter()) {
+            if p.name == "inner" {
+                assert_eq!(path.as_str(), "outer::inner");
+            } else if p.name == "outer" {
+                assert!(path.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn display_path_python_class_method() {
+        let src = "class Foo:\n    def bar(self):\n        pass\n";
+        let parsed = parse_components("python", src);
+        let paths = compute_display_paths("python", src, &parsed);
+        for (p, path) in parsed.iter().zip(paths.iter()) {
+            if p.name == "bar" && p.component_type == "def" {
+                assert_eq!(path.as_str(), "Foo.bar");
+            }
+        }
     }
 }

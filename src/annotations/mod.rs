@@ -400,6 +400,7 @@ mod tests {
             death_status: DeathStatus::Alive,
             death_evidence: Default::default(),
             faults: ComponentFaults::default(),
+            display_path: String::new(),
         }
     }
 

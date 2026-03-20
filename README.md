@@ -14,8 +14,7 @@ while they're still alive. You can see "[dead]" flagged components in "lime list
 Similarly, Lime also integrates (if available on the user's device) language specific linter tools, language analyzers to mark "faulty" components, which are the subject of error in your codebase (at least based on syntax). 
 You can see these components in the component list marked with "[Fault(s): n]". You can also filter the components with the flag "--fault". 
 
-
-
+For speed, binary size optimization, Lime utilizes regex-based component parsing, instead of AST analyzers (still deciding on picking one or the other, though regex is the current implementation). 
 
 ## How does it work?
 Lime works by identifying "components" of your codebase, instead of indexing the entire codebase, line by line. For Rust, it retrieves, for example, fn, structs, enums, etc. 

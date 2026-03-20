@@ -452,6 +452,7 @@ mod tests {
             death_status: DeathStatus::Alive,
             death_evidence: DeathEvidence::default(),
             faults: ComponentFaults::default(),
+            display_path: String::new(),
         }
     }
 
