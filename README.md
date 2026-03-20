@@ -1,31 +1,90 @@
 # Lime
-*THE* CLI tool for codebase indexation, component-dependency matrix retrieval, annotation, and more.
 
-## Overview
-Lime has several uses. For one, you can focus and latch onto one of the components in your codebase by running "lime show {type}-{hashID}", which outputs, with syntactial highlights,
-the component you requested; with the line numbers, of course.
+**Lime** is a CLI that indexes your repo into **components** (functions, types, classes, modules, …), tracks **dependencies**, and supports **annotations** and **hierarchical links**—with first-class **`--json`** output for tools and agents.
 
-It also allows you to view the dependencies (at various "depths" or chain-related dependent components) of a specific component to see what's used by, or uses, the component you've requested; run "lime deps {type}-{hashID}"
-to see the "dependency matrix". 
+[Quick start](#quick-start) · [Commands](#commands) · [Config & files](#config--files) · [Docs](#documentation)
 
-Lime can also reference components from other indexed repositories on your machine: add them to the global router (`lime registry add` for the current folder, or `lime registry add <path>`) and query with `--external <projectID>`, for example
-`lime show --external tokio fn-...`. This routes reads to the target repo's existing `.lime` data (no duplicated global index).
+## Features
 
-Lime additionally has a component death detection algorithm, which requires a component's dependencies and/or line-by-line validation to satisfy specific "inverse" requirements, which ensure components aren't marked as "dead"
-while they're still alive. You can see "[dead]" flagged components in "lime list {lang} -a", or filter by "dead" using the "--dead" flag. 
+- **Index** — full sync, git-partial sync (optional), or per-file `add` / `remove`
+- **Discover** — `search` (substring or `--fuzzy`), `list` with `--dead` / `--fault` filters
+- **Inspect** — `show` (source + line refs + optional diagnostics), `deps` (uses / used-by)
+- **Notes & navigation** — `annotate`, `links` (merged store + annotation paths), `sum` overview
+- **Multiple repos** — `registry` writes `~/.lime/projects.json`; **`--external <id>`** routes reads (and safe `annotate add`) to another registered root
+- **Settings** — project `.lime/lime.json` and optional **global** template via `lime config --global …`
 
-Similarly, Lime also integrates (if available on the user's device) language specific linter tools, language analyzers to mark "faulty" components, which are the subject of error in your codebase (at least based on syntax). 
-You can see these components in the component list marked with "[Fault(s): n]". You can also filter the components with the flag "--fault". 
+**Language aliases** (also for `list`, `annotate list`, …): `rs`→rust, `py`→python, `js`→javascript, `ts`→typescript.
 
-For speed, binary size optimization, Lime utilizes regex-based component parsing, instead of AST analyzers (still deciding on picking one or the other, though regex is the current implementation). 
+## Installation
 
-## How does it work?
-Lime works by identifying "components" of your codebase, instead of indexing the entire codebase, line by line. For Rust, it retrieves, for example, fn, structs, enums, etc. 
-Each component is assigned a hashID via Blake3 hash, prefixed with the component type; i.e. "fn-{hashID}". 
+From a clone of this repository:
 
+```bash
+cargo build --release
+# target/release/lime   (lime.exe on Windows)
+```
 
+Or install the package from the repo root:
 
-## This README.md is a work in progress, as is the project itself (though it is functional). 
-I'll probably release pre-built binaries once I really get this stable, but for now you can build from source by cloning the repository, and running "cargo build --release". It's a single binary, and currently only works
-on (been tested on; I don't actually know if it works elsewhere, the main problem is likely only path configurations) Windows. For the time being, all commits will only be made after thorough testing of each commit's
-contributions, so you should be ok using the tool from any source version (any commit).
+```bash
+cargo install --path .
+```
+
+Pre-built release binaries are not published yet; building from source is the supported path today.
+
+## Quick start
+
+```bash
+lime sync
+lime list
+lime search run
+lime show fn-<id>          # use an ID from list/search
+lime deps fn-<id>
+```
+
+Agents and scripts should pass **`--json`** on every invocation for stable, parseable output.
+
+## Commands
+
+| Command | What it does |
+|--------|----------------|
+| `sync` | Rebuild or refresh the index (`--git` / `--no-git`, optional `--diagnostics`, paths for partial) |
+| `add` / `remove` | Index or drop a single file |
+| `search` | Find components by name, path, or ID; `--fuzzy` for token + annotation matching |
+| `list` | Languages, per-type counts, or all components (`-a` / `--all`) |
+| `show` | Component body with line numbers |
+| `deps` | Dependency matrix; `--depth` |
+| `annotate` | `add` / `show` / `list` / `remove` markdown notes |
+| `links` | `show` / `list` / `add` / `remove` / `compact` for topic paths |
+| `sum` | Bounded workspace summary (e.g. link hotspots) |
+| `registry` | `list` / `add` / `remove` registered project roots |
+| `config` | View or set options; add `--global` for user-wide defaults |
+
+`--external <projectID>` is allowed only where it is safe (reads and `annotate add` to foreign trees); mutating index/link/registry commands stay on the current project.
+
+Run **`lime --help`** and **`lime <cmd> --help`** for flags and examples.
+
+## Config & files
+
+| Location | Role |
+|----------|------|
+| `.lime/lime.json` | Project settings (ignores, dependency depth, diagnostics, death seeds, git partial behavior, …) |
+| `.lime/index.json` | Default index (path overridable via config) |
+| `.lime/annotations/` | One markdown file per annotated component |
+| `.lime/component_links.json` | Link path membership (merged with annotation `links` on read) |
+| `~/.lime/projects.json` | Registered roots for `--external` |
+| `~/.config/lime/lime.json` (Unix) or `%APPDATA%\lime\lime.json` (Windows) | Global config template for **new** projects |
+
+Indexing uses **regex-oriented** parsing, not a full semantic analyzer—results are fast and good for navigation, but macros and generated code can be approximate.
+
+## Supported languages
+
+Rust, Python, JavaScript/TypeScript, Go, Zig, C, C++, and Swift (see **`SKILL.md`** for extensions and component kinds).
+
+## Documentation
+
+- **[SKILL.md](SKILL.md)** — detailed command reference, JSON field notes, agent-oriented workflows, and config tables.
+
+## License
+
+MIT
