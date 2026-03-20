@@ -38,12 +38,56 @@ pub fn save_index(root: &Path, config: &LimeConfig, index: &IndexData) -> Result
 
     let f = File::create(&index_path).context("failed creating index file")?;
     let mut w = BufWriter::new(f);
-    serde_json::to_writer_pretty(&mut w, index).context("failed serializing index json")?;
+    if config.index_pretty {
+        serde_json::to_writer_pretty(&mut w, index).context("failed serializing index json")?;
+    } else {
+        serde_json::to_writer(&mut w, index).context("failed serializing index json")?;
+    }
     w.write_all(b"\n")
         .context("failed writing index file trailing newline")?;
     w.flush()
         .with_context(|| format!("failed writing index file: {}", index_path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LimeConfig;
+    use crate::index::IndexData;
+
+    #[test]
+    fn save_index_compact_not_larger_than_pretty() {
+        let dir = std::env::temp_dir().join(format!("lime-idx-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".lime")).unwrap();
+
+        let root = &dir;
+        let mut config = LimeConfig::default();
+        config.index_storage = ".lime/index.json".to_string();
+        let index = IndexData::empty(root);
+
+        config.index_pretty = true;
+        save_index(root, &config, &index).unwrap();
+        let pretty_len = std::fs::read_to_string(config.index_path(root))
+            .unwrap()
+            .len();
+
+        config.index_pretty = false;
+        save_index(root, &config, &index).unwrap();
+        let compact = std::fs::read_to_string(config.index_path(root)).unwrap();
+        assert!(
+            compact.len() <= pretty_len,
+            "compact index json should be no larger than pretty"
+        );
+        // Compact should be one logical line of JSON + newline (no indentation spaces).
+        assert!(
+            !compact.contains("\n  "),
+            "compact output should not contain indented lines"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // ---------------------------------------------------------------------------

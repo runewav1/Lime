@@ -8,6 +8,12 @@ Lime is a fast, language-aware codebase index for AI coding agents. It builds an
 |------|-------------|
 | `--json` | Output raw JSON for scripts and agents (use this for all agent interactions) |
 
+## Recommended agent workflows
+
+**Cheap path (low token use):** Start with `lime --json sum` for counts, languages, top annotation link labels, and staleness. Drill into a topic with `lime --json link <label>`, then open specific code with `lime --json show <id>` (and `lime --json deps <id>` when needed).
+
+**Heavy path:** Use `lime --json list <lang> -a` or broad `lime --json search` / `lime --json search --fuzzy` when you need full component lists or name-based discovery. Expect larger JSON payloads.
+
 ## Commands
 
 ### lime sync
@@ -413,6 +419,18 @@ lime --json config show
 }
 ```
 
+#### lime config index
+
+Control whether `index.json` is written pretty-printed (default) or compact (smaller/faster writes on large repos).
+
+```bash
+lime --json config index
+lime --json config index --pretty false
+lime --json config index --pretty true
+```
+
+**JSON Output:** `index_pretty` (current value) and `updated` (whether `--pretty` was applied).
+
 #### lime config diagnostics
 
 ```bash
@@ -481,9 +499,10 @@ Lime reads `.lime/lime.json` for settings:
 |-----|------|---------|-------------|
 | `default_dependency_depth` | int | 2 | Max depth for dependency traversal |
 | `ignore_patterns` | array | [] | Additional patterns to exclude from indexing |
-| `index_path` | string | null | Custom location for index file |
+| `index_storage` | string | `.lime/index.json` | Relative or absolute path to index JSON |
+| `index_pretty` | bool | true | Pretty-print `index.json`; set `false` for compact JSON |
 | `diagnostics.enabled` | bool | false | Run static analyzers during sync |
-| `diagnostics.timeout_secs` | int | 30 | Per-analyzer timeout |
+| `diagnostics.timeout_secs` | int | 120 | Per-analyzer timeout |
 | `death_seeds.seed_files` | array | [] | File path patterns (always-alive roots) |
 | `death_seeds.seed_names` | array | [] | Component name patterns (always-alive roots) |
 | `death_seeds.seed_types` | array | [] | Component types (always-alive roots) |
@@ -492,10 +511,16 @@ Lime reads `.lime/lime.json` for settings:
 
 ## Index Storage
 
-- Index stored at `.lime/index.json`
+- Index stored at `.lime/index.json` (or `index_storage` in config)
 - Annotations stored at `.lime/annotations/<type>/<id>.md`
 - Index is persistent; use `lime sync` after code changes
 - Use `lime sync --diagnostics` to attach static analysis data
+
+### Operational limits (agents)
+
+- **Full index load:** Most commands read and parse the entire `index.json` into memory.
+- **Regex parsing:** Components are extracted with line/regex heuristics, not full language ASTs; treat the index as approximate for edge cases (macros, generated code, unusual syntax).
+- **Annotation reconcile:** After sync, annotations may be rewritten to match current component IDs; frequent `annotate` plus token index rebuild can add I/O on large annotation sets.
 
 ## Supported Languages
 

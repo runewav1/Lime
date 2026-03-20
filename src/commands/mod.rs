@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     fs,
     path::{Path, PathBuf},
@@ -67,6 +67,7 @@ pub fn run() -> Result<()> {
             fuzzy,
         } => handle_search(root, terms, fuzzy),
         Commands::Link { label, notes } => handle_link(root, label, notes),
+        Commands::Sum { top_links } => handle_sum(root, top_links),
         Commands::List {
             language,
             component_type,
@@ -128,7 +129,8 @@ fn exit_error(message: &str, json_mode: bool) -> ! {
   lime list rust                 Show Rust component counts
   lime list rust --all           List all Rust components
   lime deps fn-61bcc6dabec3f308  Show dependency matrix
-  lime link auth                 Components annotated with link \"auth\""#
+  lime link auth                 Components annotated with link \"auth\"
+  lime sum                       Bounded overview (counts, links, staleness)"#
 )]
 struct Cli {
     #[arg(long, global = true, help = "Output raw JSON for scripts and agents")]
@@ -215,6 +217,16 @@ enum Commands {
         /// Include full annotation markdown in each result.
         #[arg(long)]
         notes: bool,
+    },
+    /// Bounded index overview for agents (counts, top link labels, staleness; no component list).
+    ///
+    /// Examples:
+    ///   "lime sum"
+    ///   "lime sum --top-links 16"
+    Sum {
+        /// Max number of link labels to include in `links_top` (by frequency).
+        #[arg(long, default_value_t = 32)]
+        top_links: usize,
     },
     /// List indexed languages or components.
     ///
@@ -422,6 +434,73 @@ enum ConfigAction {
         #[arg(long)]
         clear_seed_types: bool,
     },
+
+    /// Index file serialization (`index.json`).
+    ///
+    /// Examples:
+    ///   "lime config index"              show current `index_pretty`
+    ///   "lime config index --pretty false"  write compact JSON on next sync/save
+    Index {
+        /// Pretty-print index JSON when saving (omit to only show current value).
+        #[arg(long)]
+        pretty: Option<bool>,
+    },
+}
+
+fn handle_sum(root: PathBuf, top_links: usize) -> Result<Value> {
+    let config = LimeConfig::load_or_create(&root)?;
+    let timer = std::time::Instant::now();
+    let index = storage::load_index_or_empty(&root, &config)?;
+    let index_staleness =
+        serde_json::to_value(git_staleness::evaluate(&root, &index)).unwrap_or(json!({}));
+
+    let all_annotations = annotations::list_annotations(&root).unwrap_or_default();
+    let diag_cache = storage::load_diagnostics_cache(&root).unwrap_or_default();
+
+    let top = top_links.clamp(1, 256);
+    let mut link_counts: HashMap<String, usize> = HashMap::new();
+    for ann in &all_annotations {
+        for link in &ann.links {
+            let key = link.trim().to_ascii_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            *link_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    let mut pairs: Vec<(String, usize)> = link_counts.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    pairs.truncate(top);
+    let links_top: Vec<Value> = pairs
+        .into_iter()
+        .map(|(link, count)| json!({ "link": link, "count": count }))
+        .collect();
+
+    let cache_entry_total: usize = diag_cache.values().map(|v| v.len()).sum();
+    let indexed_with_faults = index
+        .components
+        .iter()
+        .filter(|c| c.faults.total() > 0)
+        .count();
+
+    let elapsed = timer.elapsed();
+    Ok(json!({
+        "ok": true,
+        "command": "sum",
+        "elapsed_secs": elapsed.as_secs_f64(),
+        "languages": index.languages,
+        "component_count": index.components.len(),
+        "file_count": index.files.len(),
+        "annotation_count": all_annotations.len(),
+        "links_top": links_top,
+        "index_staleness": index_staleness,
+        "diagnostics_summary": {
+            "cache_component_count": diag_cache.len(),
+            "cache_entry_total": cache_entry_total,
+            "indexed_components_with_faults": indexed_with_faults,
+        },
+        "index_pretty": config.index_pretty,
+    }))
 }
 
 fn handle_sync(
@@ -654,6 +733,20 @@ fn handle_config(root: PathBuf, action: ConfigAction) -> Result<Value> {
                 "ok": true,
                 "command": "config_death_seeds",
                 "death_seeds": seeds,
+            }))
+        }
+        ConfigAction::Index { pretty } => {
+            let mut config = LimeConfig::load_or_create(&root)?;
+            let updated = pretty.is_some();
+            if let Some(value) = pretty {
+                config.index_pretty = value;
+                config.save(&root)?;
+            }
+            Ok(json!({
+                "ok": true,
+                "command": "config_index",
+                "index_pretty": config.index_pretty,
+                "updated": updated,
             }))
         }
     }
@@ -948,39 +1041,49 @@ fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
 
     let all_annotations = annotations::list_annotations(&root)?;
     let mut results: Vec<Value> = Vec::new();
+    let mut orphans: Vec<Value> = Vec::new();
 
     for ann in &all_annotations {
         if !annotation_matches_link(ann, q) {
             continue;
         }
-        let Some(comp) = annotations::resolve_component_for_annotation(&index, ann) else {
-            continue;
-        };
-
-        let preview = truncate_preview(&ann.content, 120);
-        let row = if notes {
-            json!({
-                "component": comp,
-                "links": ann.links,
-                "tags": ann.tags,
-                "annotation": {
-                    "hash_id": ann.hash_id,
-                    "content": ann.content,
-                    "tags": ann.tags,
+        if let Some(comp) = annotations::resolve_component_for_annotation(&index, ann) {
+            let preview = truncate_preview(&ann.content, 120);
+            let row = if notes {
+                json!({
+                    "component": comp,
                     "links": ann.links,
-                    "created_at": ann.created_at,
-                    "updated_at": ann.updated_at,
-                }
-            })
+                    "tags": ann.tags,
+                    "annotation": {
+                        "hash_id": ann.hash_id,
+                        "content": ann.content,
+                        "tags": ann.tags,
+                        "links": ann.links,
+                        "created_at": ann.created_at,
+                        "updated_at": ann.updated_at,
+                    }
+                })
+            } else {
+                json!({
+                    "component": comp,
+                    "links": ann.links,
+                    "tags": ann.tags,
+                    "annotation_preview": preview,
+                })
+            };
+            results.push(row);
         } else {
-            json!({
-                "component": comp,
+            orphans.push(json!({
+                "hash_id": ann.hash_id,
+                "component_name": ann.component_name,
+                "component_type": ann.component_type,
+                "file": ann.file,
+                "language": ann.language,
                 "links": ann.links,
                 "tags": ann.tags,
-                "annotation_preview": preview,
-            })
-        };
-        results.push(row);
+                "annotation_preview": truncate_preview(&ann.content, 120),
+            }));
+        }
     }
 
     results.sort_by(|a, b| {
@@ -1006,6 +1109,7 @@ fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
     });
 
     let elapsed = timer.elapsed();
+    let orphan_count = orphans.len();
     Ok(json!({
         "ok": true,
         "command": "link",
@@ -1013,6 +1117,8 @@ fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
         "notes": notes,
         "result_count": results.len(),
         "results": results,
+        "orphan_count": orphan_count,
+        "orphans": orphans,
         "elapsed_secs": elapsed.as_secs_f64(),
         "index_staleness": index_staleness
     }))

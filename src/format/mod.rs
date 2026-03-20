@@ -105,6 +105,7 @@ pub fn render(payload: &Value) -> String {
         "remove" => render_remove(payload, &s),
         "search" => render_search(payload, &s),
         "link" => render_link(payload, &s),
+        "sum" => render_sum(payload, &s),
         "list" => render_list(payload, &s),
         "deps" => render_deps(payload, &s),
         "annotate" => render_annotate(payload, &s),
@@ -331,15 +332,25 @@ fn render_link(v: &Value, s: &Style) -> String {
     let mut out = String::new();
     write_staleness_banner(&mut out, v, s);
     let count = num_val(v, "result_count");
+    let orphan_count = v.get("orphan_count").and_then(Value::as_u64).unwrap_or(0);
     let notes = v.get("notes").and_then(Value::as_bool).unwrap_or(false);
     let link_label = str_val(v, "link");
 
     if count == 0 {
         let _ = writeln!(
             out,
-            "No components with link {}",
+            "No indexed components with link {}",
             s.dim(&link_label)
         );
+        if orphan_count > 0 {
+            let _ = writeln!(
+                out,
+                "{}",
+                s.yellow(&format!(
+                    "  {orphan_count} orphan annotation(s) match this link (no index component; see JSON \"orphans\")"
+                ))
+            );
+        }
         return out;
     }
 
@@ -424,6 +435,115 @@ fn render_link(v: &Value, s: &Style) -> String {
         s.bold(&format!("{count} component{}", plural(count))),
         timing
     );
+    if orphan_count > 0 {
+        let _ = writeln!(
+            out,
+            "{}",
+            s.yellow(&format!(
+                "{orphan_count} orphan annotation(s) also matched (see JSON \"orphans\")"
+            ))
+        );
+    }
+    out
+}
+
+// ── sum (bounded overview) ─────────────────────────────────────
+
+fn render_sum(v: &Value, s: &Style) -> String {
+    let mut out = String::new();
+    write_staleness_banner(&mut out, v, s);
+
+    let langs = v
+        .get("languages")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+
+    let _ = writeln!(out, "{}", s.bold("Overview"));
+    let _ = writeln!(
+        out,
+        "  {}  {}",
+        s.dim("languages:"),
+        if langs.is_empty() {
+            s.dim("(none)")
+        } else {
+            langs
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  {}  {}",
+        s.dim("components:"),
+        num_val(v, "component_count")
+    );
+    let _ = writeln!(
+        out,
+        "  {}  {}",
+        s.dim("files:"),
+        num_val(v, "file_count")
+    );
+    let _ = writeln!(
+        out,
+        "  {}  {}",
+        s.dim("annotations:"),
+        num_val(v, "annotation_count")
+    );
+    let pretty = v
+        .get("index_pretty")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let _ = writeln!(
+        out,
+        "  {}  {}",
+        s.dim("index_pretty:"),
+        if pretty { "true" } else { "false" }
+    );
+
+    if let Some(arr) = v.get("links_top").and_then(Value::as_array) {
+        if !arr.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "{}", s.bold("Top annotation links"));
+            for entry in arr {
+                let link = entry.get("link").and_then(Value::as_str).unwrap_or("");
+                let c = entry.get("count").and_then(Value::as_u64).unwrap_or(0);
+                let _ = writeln!(out, "  {}  {}", s.cyan(link), s.dim(&format!("×{c}")));
+            }
+        }
+    }
+
+    if let Some(ds) = v.get("diagnostics_summary") {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{}", s.bold("Diagnostics (summary)"));
+        let _ = writeln!(
+            out,
+            "  {}  {}",
+            s.dim("cache components:"),
+            num_val(ds, "cache_component_count")
+        );
+        let _ = writeln!(
+            out,
+            "  {}  {}",
+            s.dim("cache entries:"),
+            num_val(ds, "cache_entry_total")
+        );
+        let _ = writeln!(
+            out,
+            "  {}  {}",
+            s.dim("indexed w/ faults:"),
+            num_val(ds, "indexed_components_with_faults")
+        );
+    }
+
+    if let Some(elapsed) = v.get("elapsed_secs").and_then(Value::as_f64) {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{}", s.dim(&format_duration(elapsed)));
+    }
+
     out
 }
 

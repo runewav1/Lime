@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 
 const CONFIG_FILE: &str = ".lime/lime.json";
 
+fn default_index_pretty() -> bool {
+    true
+}
+
 /// Runtime configuration for Lime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -18,6 +22,9 @@ pub struct LimeConfig {
     pub ignore_patterns: Vec<String>,
     /// Relative or absolute path to the index JSON file.
     pub index_storage: String,
+    /// When true (default), `index.json` is written pretty-printed. Set false for smaller, faster writes.
+    #[serde(default = "default_index_pretty")]
+    pub index_pretty: bool,
     /// Death detection seed overrides.
     #[serde(default)]
     pub death_seeds: DeathSeedConfig,
@@ -71,6 +78,7 @@ impl Default for LimeConfig {
             death_seeds: DeathSeedConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             index_storage: ".lime/index.json".to_string(),
+            index_pretty: true,
         }
     }
 }
