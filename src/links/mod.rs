@@ -241,7 +241,7 @@ pub fn add_membership(root: &Path, component_id: &str, path: &str) -> Result<()>
         }
         list.push(normalized);
     }
-    list.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+    list.sort_by_key(|a| a.to_ascii_lowercase());
     save_component_links(root, &store)
 }
 

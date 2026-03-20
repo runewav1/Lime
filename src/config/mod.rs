@@ -31,6 +31,26 @@ pub struct LimeConfig {
     /// Diagnostics / static analysis configuration.
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
+    /// Empty `lime sync` (no file args): use git dirty paths vs full rebuild.
+    #[serde(default)]
+    pub git_partial_sync: GitPartialSyncConfig,
+}
+
+/// When `empty_sync_uses_git` is true, `lime sync` with no file arguments runs partial sync
+/// on paths reported by `git status --porcelain` (unless overridden by `--no-git` / `--git`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GitPartialSyncConfig {
+    /// If true, `lime sync` with no paths uses git working-tree changes for partial indexing.
+    pub empty_sync_uses_git: bool,
+}
+
+impl Default for GitPartialSyncConfig {
+    fn default() -> Self {
+        Self {
+            empty_sync_uses_git: false,
+        }
+    }
 }
 
 /// Controls which components are treated as alive seeds in death detection.
@@ -77,6 +97,7 @@ impl Default for LimeConfig {
             ],
             death_seeds: DeathSeedConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
+            git_partial_sync: GitPartialSyncConfig::default(),
             index_storage: ".lime/index.json".to_string(),
             index_pretty: true,
         }

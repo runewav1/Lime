@@ -60,7 +60,9 @@ pub fn run() -> Result<()> {
             files,
             diagnostics,
             verbose,
-        } => handle_sync(root, files, diagnostics, verbose),
+            git,
+            no_git,
+        } => handle_sync(root, files, diagnostics, verbose, git, no_git),
         Commands::Add { filename } => handle_add(root, filename),
         Commands::Remove { filename } => handle_remove(root, filename),
         Commands::Search {
@@ -124,7 +126,8 @@ fn exit_error(message: &str, json_mode: bool) -> ! {
     name = "lime",
     version,
     after_long_help = r#"Examples:
-  lime sync                      Rebuild entire index
+  lime sync                      Full index (default) or git partial if configured
+  lime sync --git                Partial sync on git dirty paths
   lime search run                Find components named "run"
   lime search rust fn run        Search Rust functions
   lime list rust                 Show Rust component counts
@@ -150,11 +153,12 @@ enum Commands {
     /// only those files are re-indexed; the rest stays intact.
     ///
     /// Examples:
-    ///   "lime sync"                        rebuild entire index
-    ///   "lime sync src/main.rs"            re-index a single file
-    ///   "lime sync src/lib.rs src/util.rs" re-index multiple files
+    ///   "lime sync"                        full index (default) or git partial if configured
+    ///   "lime sync --git"                  partial sync on git dirty paths
+    ///   "lime sync --no-git"               full rebuild even if config uses git partial
+    ///   "lime sync src/main.rs"            re-index a single file (git flags ignored)
     Sync {
-        /// Specific files to re-index. Omit to rebuild the entire index.
+        /// Specific files to re-index. Omit: full rebuild or git partial per config/flags.
         files: Vec<String>,
         /// Run static analyzers and attach fault data to components.
         #[arg(long)]
@@ -162,6 +166,12 @@ enum Commands {
         /// Show detailed output (component breakdown).
         #[arg(short = 'v', long)]
         verbose: bool,
+        /// Empty sync: partial index on `git status` dirty paths (overrides config default).
+        #[arg(long, conflicts_with = "no_git")]
+        git: bool,
+        /// Empty sync: full rebuild (overrides `git_partial_sync.empty_sync_uses_git`).
+        #[arg(long, conflicts_with = "git")]
+        no_git: bool,
     },
     /// Add a single file to the index.
     ///
@@ -494,6 +504,17 @@ enum ConfigAction {
         #[arg(long)]
         pretty: Option<bool>,
     },
+
+    /// Git-assisted partial sync when `lime sync` is run with no file arguments.
+    ///
+    /// Examples:
+    ///   "lime config git-partial-sync"
+    ///   "lime config git-partial-sync --use-git-for-empty-sync true"
+    GitPartialSync {
+        /// Use `git status` dirty paths for empty `lime sync` (omit to only show current value).
+        #[arg(long = "use-git-for-empty-sync")]
+        use_git_for_empty_sync: Option<bool>,
+    },
 }
 
 fn handle_sum(root: PathBuf, top_links: usize) -> Result<Value> {
@@ -555,11 +576,54 @@ fn handle_sync(
     files: Vec<String>,
     run_diagnostics: bool,
     verbose: bool,
+    git: bool,
+    no_git: bool,
 ) -> Result<Value> {
     let config = LimeConfig::load_or_create(&root)?;
     let do_diag = run_diagnostics || config.diagnostics.enabled;
 
-    if files.is_empty() {
+    if !files.is_empty() {
+        let current = storage::load_index_or_empty(&root, &config)?;
+        let timer = std::time::Instant::now();
+        let (mut updated, result) = index::sync_files(&root, &config, &files, current)?;
+
+        let diag_result = run_and_attach_diagnostics(&root, &mut updated, do_diag);
+
+        let elapsed = timer.elapsed();
+        git_staleness::refresh_git_head_at_sync(&mut updated, &root);
+        storage::save_index(&root, &config, &updated)?;
+        persist_token_index(&root, &updated);
+
+        let mut response = json!({
+            "ok": true,
+            "command": "sync",
+            "scope": "partial",
+            "sync_mode": "partial",
+            "elapsed_secs": elapsed.as_secs_f64(),
+            "request": {
+                "files": files
+            },
+            "result": result,
+            "index": index_payload_with_staleness(&root, &updated)
+        });
+        if verbose {
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("verbose".into(), json!(true));
+            }
+        }
+        response["diagnostics"] = diag_result;
+        return Ok(response);
+    }
+
+    let use_git_partial = if git {
+        true
+    } else if no_git {
+        false
+    } else {
+        config.git_partial_sync.empty_sync_uses_git
+    };
+
+    if !use_git_partial {
         let timer = std::time::Instant::now();
         let mut index = index::rebuild_index(&root, &config)?;
 
@@ -574,6 +638,35 @@ fn handle_sync(
             "ok": true,
             "command": "sync",
             "scope": "full",
+            "sync_mode": "full",
+            "elapsed_secs": elapsed.as_secs_f64(),
+            "index": index_payload_with_staleness(&root, &index)
+        });
+        if verbose {
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("verbose".into(), json!(true));
+            }
+        }
+        response["diagnostics"] = diag_result;
+        return Ok(response);
+    }
+
+    let timer = std::time::Instant::now();
+
+    if !git_staleness::is_inside_git_work_tree(&root) {
+        let mut index = index::rebuild_index(&root, &config)?;
+        let diag_result = run_and_attach_diagnostics(&root, &mut index, do_diag);
+        let elapsed = timer.elapsed();
+        git_staleness::refresh_git_head_at_sync(&mut index, &root);
+        storage::save_index(&root, &config, &index)?;
+        persist_token_index(&root, &index);
+
+        let mut response = json!({
+            "ok": true,
+            "command": "sync",
+            "scope": "full",
+            "sync_mode": "full",
+            "git_partial_fallback": "not_a_git_repository",
             "elapsed_secs": elapsed.as_secs_f64(),
             "index": index_payload_with_staleness(&root, &index)
         });
@@ -587,11 +680,78 @@ fn handle_sync(
     }
 
     let current = storage::load_index_or_empty(&root, &config)?;
-    let timer = std::time::Instant::now();
-    let (mut updated, result) = index::sync_files(&root, &config, &files, current)?;
+    let dirty = match git_staleness::worktree_changed_paths(&root) {
+        Ok(d) => d,
+        Err(e) => {
+            let mut index = index::rebuild_index(&root, &config)?;
+            let diag_result = run_and_attach_diagnostics(&root, &mut index, do_diag);
+            let elapsed = timer.elapsed();
+            git_staleness::refresh_git_head_at_sync(&mut index, &root);
+            storage::save_index(&root, &config, &index)?;
+            persist_token_index(&root, &index);
 
+            let mut response = json!({
+                "ok": true,
+                "command": "sync",
+                "scope": "full",
+                "sync_mode": "full",
+                "git_partial_fallback": "git_status_failed",
+                "git_partial_error": e,
+                "elapsed_secs": elapsed.as_secs_f64(),
+                "index": index_payload_with_staleness(&root, &index)
+            });
+            if verbose {
+                if let Some(obj) = response.as_object_mut() {
+                    obj.insert("verbose".into(), json!(true));
+                }
+            }
+            response["diagnostics"] = diag_result;
+            return Ok(response);
+        }
+    };
+
+    let candidate_count = dirty.len();
+    let to_sync = index::filter_worktree_paths_for_sync(&root, &config, &current, &dirty)?;
+
+    if to_sync.is_empty() {
+        let mut index = current;
+        let diag_result = if do_diag {
+            json!({
+                "enabled": true,
+                "status": "skipped",
+                "reason": "git_partial_noop_no_indexable_dirty_paths"
+            })
+        } else {
+            json!({ "enabled": false, "status": "skipped" })
+        };
+        git_staleness::refresh_git_head_at_sync(&mut index, &root);
+        storage::save_index(&root, &config, &index)?;
+        persist_token_index(&root, &index);
+        let elapsed = timer.elapsed();
+
+        let mut response = json!({
+            "ok": true,
+            "command": "sync",
+            "scope": "noop",
+            "sync_mode": "noop",
+            "elapsed_secs": elapsed.as_secs_f64(),
+            "git_partial": {
+                "candidates": candidate_count,
+                "sync_paths": [],
+            },
+            "index": index_payload_with_staleness(&root, &index)
+        });
+        if verbose {
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("verbose".into(), json!(true));
+            }
+        }
+        response["diagnostics"] = diag_result;
+        return Ok(response);
+    }
+
+    let (mut updated, result) = index::sync_files(&root, &config, &to_sync, current)?;
     let diag_result = run_and_attach_diagnostics(&root, &mut updated, do_diag);
-
     let elapsed = timer.elapsed();
     git_staleness::refresh_git_head_at_sync(&mut updated, &root);
     storage::save_index(&root, &config, &updated)?;
@@ -601,9 +761,11 @@ fn handle_sync(
         "ok": true,
         "command": "sync",
         "scope": "partial",
+        "sync_mode": "git_partial",
         "elapsed_secs": elapsed.as_secs_f64(),
-        "request": {
-            "files": files
+        "git_partial": {
+            "candidates": candidate_count,
+            "sync_paths": to_sync,
         },
         "result": result,
         "index": index_payload_with_staleness(&root, &updated)
@@ -793,6 +955,22 @@ fn handle_config(root: PathBuf, action: ConfigAction) -> Result<Value> {
                 "ok": true,
                 "command": "config_index",
                 "index_pretty": config.index_pretty,
+                "updated": updated,
+            }))
+        }
+        ConfigAction::GitPartialSync {
+            use_git_for_empty_sync,
+        } => {
+            let mut config = LimeConfig::load_or_create(&root)?;
+            let updated = use_git_for_empty_sync.is_some();
+            if let Some(value) = use_git_for_empty_sync {
+                config.git_partial_sync.empty_sync_uses_git = value;
+                config.save(&root)?;
+            }
+            Ok(json!({
+                "ok": true,
+                "command": "config_git_partial_sync",
+                "empty_sync_uses_git": config.git_partial_sync.empty_sync_uses_git,
                 "updated": updated,
             }))
         }

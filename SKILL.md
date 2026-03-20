@@ -8,7 +8,7 @@ Language-aware codebase index for AI agents. Indexes functions, structs, classes
 ## Quick Start
 
 ```
-lime --json sync                          # build/rebuild full index
+lime --json sync                          # full index (default) or git partial if configured
 lime --json search run                    # find components named "run"
 lime --json list rust --all               # list all rust components with IDs
 lime --json show fn-61bcc6dabec3f308      # show component source
@@ -17,15 +17,31 @@ lime --json deps fn-61bcc6dabec3f308      # dependency matrix
 
 ## Commands
 
-### sync [files...] [--diagnostics] [-v]
-Rebuild index. No args = full scan. With files = re-index only those.
+### sync [files...] [--diagnostics] [-v] [--git | --no-git]
+Rebuild index. **With file paths:** partial re-index of only those files (`--git` / `--no-git` ignored).
+
+**With no file arguments:** behavior depends on config and flags:
+
+| Resolution | Effect |
+|------------|--------|
+| `--git` | Partial sync on paths from `git status --porcelain` (working tree + untracked). |
+| `--no-git` | Full rebuild (overrides `git_partial_sync.empty_sync_uses_git`). |
+| Neither | If `git_partial_sync.empty_sync_uses_git` is **true**, same as `--git`; else **full** rebuild. |
+
+If git mode is selected but the project is **not** a git repo (or `git status` fails), Lime **falls back to a full rebuild** and sets JSON `git_partial_fallback` (`not_a_git_repository` / `git_status_failed`). If the work tree is clean or every dirty path is ignored / non-indexable, JSON has `scope: "noop"`, `sync_mode: "noop"` (index refreshed; no file re-parse).
+
+There is **no background watcher**—run `lime sync` when you want the index updated.
 
 ```bash
 lime --json sync
+lime --json sync --git
+lime --json sync --no-git
 lime --json sync src/main.rs src/lib.rs
 lime --json sync --diagnostics            # attach static-analyzer faults
 lime --json sync -v                       # verbose breakdown
 ```
+
+**JSON (selected):** `sync_mode`: `full` | `git_partial` | `noop` | `partial`; optional `git_partial: { candidates, sync_paths }`, `git_partial_fallback`.
 
 ### add <filepath>
 Add/refresh a single file. Returns `{ok, command:"add", elapsed_secs, request:{filename}, result, index}`.
@@ -139,7 +155,7 @@ lime --json links compact                 # drop duplicate link lines from annot
 
 Bounded overview; **`links_top`** counts components per path using the **same merged** membership as `lime links show` / search tokens (not annotations alone).
 
-### config {show|diagnostics|death-seeds|index}
+### config {show|diagnostics|death-seeds|index|git-partial-sync}
 
 ```bash
 lime --json config show
@@ -147,6 +163,8 @@ lime --json config diagnostics --enabled true --timeout 60
 lime --json config death-seeds --seed-file "src/main.rs" --seed-name "main" --seed-type "fn"
 lime --json config death-seeds --clear-seed-files   # clear before adding
 lime --json config index --pretty false              # compact JSON writes
+lime --json config git-partial-sync                 # show empty_sync_uses_git
+lime --json config git-partial-sync --use-git-for-empty-sync true
 ```
 
 death-seeds flags: `--seed-file <pattern>`, `--seed-name <name>`, `--seed-type <type>`, `--clear-seed-files`, `--clear-seed-names`, `--clear-seed-types`.
@@ -164,6 +182,7 @@ death-seeds flags: `--seed-file <pattern>`, `--seed-name <name>`, `--seed-type <
 | `death_seeds.seed_files` | [] | File patterns (always-alive) |
 | `death_seeds.seed_names` | [] | Component name patterns (always-alive) |
 | `death_seeds.seed_types` | [] | Component types (always-alive) |
+| `git_partial_sync.empty_sync_uses_git` | false | If true, bare `lime sync` uses git dirty paths (partial) instead of full rebuild |
 
 Default ignores: `node_modules`, `target`, `.git`, `.lime`, `.lemon`
 
@@ -204,6 +223,7 @@ Usage Scenarios:
 'lime sync' for codebase indexation
 'lime list -a --json' to retrieve all components
 'lime show {componentID}' to show the component content, attached annotations for context
-'lime links show {path-or-prefix}' — components via merged link store + annotations; 'lime links list|add|remove|compact' for paths and '.lime/component_links.json'
+'lime links show {path-or-prefix}' — components via merged link store + annotations; 
+'lime links list|add|remove|compact' for paths and '.lime/component_links.json'
 
 

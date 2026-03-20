@@ -165,7 +165,23 @@ fn render_sync(v: &Value, s: &Style) -> String {
                 write_component_breakdown(&mut out, idx, s);
             }
         }
+        if let Some(fb) = v.get("git_partial_fallback").and_then(Value::as_str) {
+            let _ = writeln!(
+                out,
+                "\n{} {}",
+                s.yellow("git partial unavailable:"),
+                s.dim(fb)
+            );
+        }
     } else if scope == "partial" {
+        let sync_mode = str_val(v, "sync_mode");
+        if sync_mode == "git_partial" {
+            let _ = writeln!(
+                out,
+                "{}",
+                s.dim("Git partial sync (dirty paths → re-indexed files)")
+            );
+        }
         if let Some(result) = v.get("result") {
             write_file_result(&mut out, result, s);
         }
@@ -175,6 +191,21 @@ fn render_sync(v: &Value, s: &Style) -> String {
                 write_component_breakdown(&mut out, idx, s);
             }
         }
+    } else if scope == "noop" {
+        let candidates = v
+            .get("git_partial")
+            .and_then(|g| g.get("candidates"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "{} — {}",
+            s.bold("No indexable changes"),
+            s.dim(&format!(
+                "git reported {candidates} dirty path(s); none require re-index (or all ignored)"
+            ))
+        );
+        write_index_summary(&mut out, v, s, true);
     }
 
     out

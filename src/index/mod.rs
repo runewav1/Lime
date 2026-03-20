@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -379,6 +379,46 @@ pub fn sync_files(
 
     refresh_dependencies_from_disk(root, config, &mut index)?;
     Ok((index, result))
+}
+
+/// Narrows git-reported dirty paths to what [`sync_files`] should process: indexable files,
+/// paths ignored by Lime/git rules skipped, and indexed paths that no longer exist (removals).
+pub fn filter_worktree_paths_for_sync(
+    root: &Path,
+    config: &LimeConfig,
+    index: &IndexData,
+    dirty: &HashSet<String>,
+) -> Result<Vec<String>> {
+    let matcher = build_ignore_matcher(root, config)?;
+    let indexed_paths: HashSet<String> = index.files.iter().map(|f| f.path.clone()).collect();
+    let mut out: Vec<String> = Vec::new();
+
+    for raw in dirty {
+        let rel = raw.replace('\\', "/");
+        let absolute = root.join(&rel);
+
+        if absolute.exists() {
+            let meta = match fs::metadata(&absolute) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                continue;
+            }
+            if is_ignored(root, &absolute, false, &matcher) {
+                continue;
+            }
+            if detect_path_language(&absolute).is_some() {
+                out.push(rel);
+            }
+        } else if indexed_paths.contains(&rel) {
+            out.push(rel);
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 fn discover_supported_files(root: &Path, config: &LimeConfig) -> Result<Vec<PathBuf>> {
@@ -831,5 +871,70 @@ mod component_id_tests {
                 assert_eq!(path.as_str(), "Foo.bar");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod filter_worktree_tests {
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{filter_worktree_paths_for_sync, IndexData, IndexedFile, LimeConfig};
+
+    fn tmp_root() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("lime_filter_test_{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn filter_includes_detectable_language_file() {
+        let root = tmp_root();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "fn x() {}\n").unwrap();
+        let config = LimeConfig::default();
+        let index = IndexData::empty(&root);
+        let mut dirty = HashSet::new();
+        dirty.insert("src/lib.rs".to_string());
+        let out = filter_worktree_paths_for_sync(&root, &config, &index, &dirty).unwrap();
+        assert_eq!(out, vec!["src/lib.rs"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn filter_includes_deleted_path_when_indexed() {
+        let root = tmp_root();
+        let config = LimeConfig::default();
+        let mut index = IndexData::empty(&root);
+        index.files.push(IndexedFile {
+            path: "gone.rs".to_string(),
+            language: "rust".to_string(),
+            file_hash: "0".to_string(),
+            component_ids: vec![],
+        });
+        let mut dirty = HashSet::new();
+        dirty.insert("gone.rs".to_string());
+        let out = filter_worktree_paths_for_sync(&root, &config, &index, &dirty).unwrap();
+        assert_eq!(out, vec!["gone.rs"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn filter_drops_unsupported_extension_when_not_indexed() {
+        let root = tmp_root();
+        fs::write(root.join("note.txt"), "hi").unwrap();
+        let config = LimeConfig::default();
+        let index = IndexData::empty(&root);
+        let mut dirty = HashSet::new();
+        dirty.insert("note.txt".to_string());
+        let out = filter_worktree_paths_for_sync(&root, &config, &index, &dirty).unwrap();
+        assert!(out.is_empty());
+        let _ = fs::remove_dir_all(&root);
     }
 }

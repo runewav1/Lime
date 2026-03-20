@@ -6,6 +6,19 @@ use std::{
     process::Command,
 };
 
+/// True when `root` is inside a git work tree (`git rev-parse --is-inside-work-tree`).
+pub fn is_inside_git_work_tree(root: &Path) -> bool {
+    match git_output(root, &["rev-parse", "--is-inside-work-tree"]) {
+        Ok(s) => s.trim() == "true",
+        Err(_) => false,
+    }
+}
+
+/// Repo-relative paths (`/` separators) with working-tree changes vs `HEAD` (porcelain), including untracked.
+pub fn worktree_changed_paths(root: &Path) -> Result<HashSet<String>, String> {
+    git_dirty_paths(root)
+}
+
 use serde::Serialize;
 
 use crate::index::IndexData;
