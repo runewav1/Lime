@@ -60,9 +60,14 @@ lime --json remove src/old.rs
 ### search [language] [type] <query> [--fuzzy]
 Case-insensitive substring match on names, IDs, file paths.
 
+**Language aliases:** `rs` → rust, `py` → python, `js` → javascript, `ts` → typescript (same for `list`, `annotate list`, etc.).
+
 ```bash
 lime --json search run                    # all languages
 lime --json search rust run               # filter language
+lime --json search rs main               # rust (alias)
+lime --json search py class              # python (alias)
+lime --json search js run                 # javascript (alias)
 lime --json search rust fn run            # filter language + type
 lime --json search --fuzzy auth           # fuzzy: token + annotation search
 ```
@@ -75,6 +80,9 @@ lime --json search --fuzzy auth           # fuzzy: token + annotation search
 ```bash
 lime --json list                          # list indexed languages
 lime --json list rust                     # component counts by type
+lime --json list rs -a                    # all rust components (alias)
+lime --json list py -a                    # all python components (alias)
+lime --json list ts -a                    # all typescript components (alias)
 lime --json list rust -a                  # all components with IDs
 lime --json list rust fn                  # only functions
 lime --json list rust --dead              # dead components only
@@ -112,7 +120,7 @@ lime --json annotate add <id> --file notes/id.md      # from file
 lime --json annotate add <id> -m "x" -t keep -t api   # with tags
 lime --json annotate add <id> -m "x" -l auth          # with link label
 lime --json annotate show <id>
-lime --json annotate list [language] [type]
+lime --json annotate list [language] [type]   # e.g. `rs fn`, `py class`, `ts fn`
 lime --json annotate remove <id>
 ```
 

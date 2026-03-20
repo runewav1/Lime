@@ -329,12 +329,13 @@ enum Commands {
     /// Format: lime search [language] [type] <query>
     /// Case-insensitive substring match on names, IDs, and file paths.
     ///
-    /// Languages: rust, javascript, typescript, python, go, zig, c, cpp, swift
+    /// Languages: rust (alias: rs), python (alias: py), javascript (alias: js), typescript (alias: ts), go, zig, c, cpp, swift
     /// Types:     fn, struct, enum, trait, impl, class, def, func, and more
     ///
     /// Examples:
     ///   "lime search run"               search all languages
     ///   "lime search rust run"          filter by language
+    ///   "lime search js run"            javascript via alias
     ///   "lime search rust fn run"       filter by language and type
     ///   "lime search --fuzzy auth"      fuzzy match on tokens and annotations
     Search {
@@ -380,7 +381,7 @@ enum Commands {
     ///
     /// Format: lime list [language] [type | --all]
     ///
-    /// Languages: rust, javascript, typescript, python, go, zig, c, cpp, swift
+    /// Languages: rust (alias: rs), python (alias: py), javascript (alias: js), typescript (alias: ts), go, zig, c, cpp, swift
     ///
     /// Examples:
     ///   "lime list"              list all indexed languages
@@ -388,8 +389,9 @@ enum Commands {
     ///   "lime list rust --all"   list every component with IDs
     ///   "lime list rust fn"      list only functions
     ///   "lime list python class" list only classes
+    ///   "lime list ts --all"     typescript components (alias)
     List {
-        /// Language to inspect (e.g. `rust`, `python`).
+        /// Language to inspect (`rs`/`py`/`js`/`ts` → rust/python/javascript/typescript).
         language: Option<String>,
         /// Component type to filter by (e.g. `fn`, `struct`, `class`).
         #[arg(allow_hyphen_values = true)]
@@ -597,9 +599,10 @@ enum AnnotateAction {
     /// Examples:
     ///   "lime annotate list"              list all annotations
     ///   "lime annotate list rust"         filter by language
+    ///   "lime annotate list ts fn"        typescript (alias) + type
     ///   "lime annotate list rust fn"      filter by language and type
     List {
-        /// Filter by language (e.g. `rust`, `python`).
+        /// Filter by language (`rs`/`py`/`js`/`ts` aliases supported).
         language: Option<String>,
         /// Filter by component type (e.g. `fn`, `struct`).
         component_type: Option<String>,
@@ -2469,6 +2472,10 @@ fn handle_annotate(target: CommandTarget, action: AnnotateAction) -> Result<Valu
             language,
             component_type,
         } => {
+            let language = match &language {
+                Some(l) => Some(normalize_language(l)?),
+                None => None,
+            };
             let all_annotations = annotations::list_annotations(&root)?;
 
             let filtered: Vec<Value> = all_annotations
@@ -2581,12 +2588,19 @@ fn parse_search_terms(terms: Vec<String>) -> Result<SearchQuery> {
 }
 
 fn normalize_language(value: &str) -> Result<String> {
-    let normalized = value.to_ascii_lowercase();
-    if supported_languages().contains(&normalized.as_str()) {
-        Ok(normalized)
+    let lower = value.trim().to_ascii_lowercase();
+    let canonical: &str = match lower.as_str() {
+        "js" => "javascript",
+        "ts" => "typescript",
+        "rs" => "rust",
+        "py" => "python",
+        other => other,
+    };
+    if supported_languages().contains(&canonical) {
+        Ok(canonical.to_string())
     } else {
         bail!(
-            "unsupported language `{value}`; supported languages: {}",
+            "unsupported language `{value}`; supported: {} (aliases: rs→rust, py→python, js→javascript, ts→typescript)",
             supported_languages().join(", ")
         )
     }
@@ -2790,5 +2804,31 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normalize_language_aliases() {
+        assert_eq!(normalize_language("rs").unwrap(), "rust");
+        assert_eq!(normalize_language("RS").unwrap(), "rust");
+        assert_eq!(normalize_language("py").unwrap(), "python");
+        assert_eq!(normalize_language("PY").unwrap(), "python");
+        assert_eq!(normalize_language("js").unwrap(), "javascript");
+        assert_eq!(normalize_language("JS").unwrap(), "javascript");
+        assert_eq!(normalize_language("ts").unwrap(), "typescript");
+        assert_eq!(normalize_language("TS").unwrap(), "typescript");
+        assert_eq!(normalize_language("rust").unwrap(), "rust");
+        assert_eq!(normalize_language("python").unwrap(), "python");
+        assert_eq!(normalize_language("javascript").unwrap(), "javascript");
+        assert_eq!(normalize_language("typescript").unwrap(), "typescript");
+    }
+
+    #[test]
+    fn parse_search_terms_accepts_language_aliases() {
+        let q = parse_search_terms(vec!["js".into(), "run".into()]).unwrap();
+        assert_eq!(q.language.as_deref(), Some("javascript"));
+        assert_eq!(q.query, "run");
+        let q = parse_search_terms(vec!["rs".into(), "main".into()]).unwrap();
+        assert_eq!(q.language.as_deref(), Some("rust"));
+        assert_eq!(q.query, "main");
     }
 }
