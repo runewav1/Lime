@@ -109,40 +109,35 @@ Flags: `-m/--message` (inline body), `--file` (body from path; exclusive with `-
 - **Delimiter:** `/` only. Segments are non-empty; no leading/trailing `/`, no `//`.
 - **Hierarchy:** prefix = ancestry (`auth` is parent of `auth/login`).
 - **Order (default):** Unicode **lexicographic** sort on the full path. Encode timelines with zero-padded segments, e.g. `auth/01-discovery`, `auth/02-design`, or date buckets `auth/2026-03/01-login`.
-- **Matching:** `lime link <query>` matches a path **equal** to `query` or any path **under** `query/` (case-insensitive).
+- **Matching:** `lime links show <query>` matches a path **equal** to `query` or any path **under** `query/` (case-insensitive).
 - **Limits:** path length and count per component are capped (see code: `MAX_LINK_PATH_LEN`, `MAX_PATHS_PER_COMPONENT`).
 
-Optional **`.lime/link_catalog.json`**: map path → `{ title, description, parent_path, sort_key }`. When present, `sort_key` orders paths before lexicographic path (used by `lime links list` and `lime link` grouping).
+Optional **`.lime/link_catalog.json`**: map path → `{ title, description, parent_path, sort_key }`. When present, `sort_key` orders paths before lexicographic path (used by `lime links list` and `lime links show` grouping).
 
-### links {add|remove|list|compact}
+### links {show|list|add|remove|compact}
 
-Manage membership in **`.lime/component_links.json`** without editing annotations.
+Single command for all link workflows (merged **`.lime/component_links.json`** + annotation `links`).
 
 ```bash
+lime --json links show auth               # components on path auth or under auth/…
+lime --json links show auth/login --notes # include full annotation bodies
+lime --json links list                    # all distinct paths
+lime --json links list auth --tree        # indent by / depth
 lime --json links add fn-abc123 auth/login
 lime --json links remove fn-abc123 auth/login
-lime --json links list                  # all distinct paths (merged store + annotations)
-lime --json links list auth --tree      # indent by / depth
-lime --json links compact               # strip duplicate link lines from annotations when store already has path
+lime --json links compact                 # drop duplicate link lines from annotations when store has path
 ```
 
-**JSON:** `{ok, command:"links", action, elapsed_secs, ...}` — `list` adds `paths`, `path_count`, `tree`, `prefix`; `remove` adds `removed`; `compact` adds `annotations_updated`.
+**JSON:** `{ok, command:"links", action, elapsed_secs, ...}`
 
-### link <path-or-prefix> [--notes]
-
-List indexed components whose **merged** link paths match the query (link store ∪ annotation `links`). Terminal output groups by path (sorted) with `/`-depth indentation.
-
-```bash
-lime --json link auth
-lime --json link auth/login
-lime --json link auth --notes             # include full annotation markdown when present
-```
-
-**JSON:** `{ok, command:"link", link, notes, result_count, results, path_groups:[{path, depth, components}], orphan_count, orphans:[{kind:"annotation",...}], orphan_memberships:[{kind:"link_store", component_id, paths}], ...}`
+- **show** — `action:"show"`, plus `link`, `notes`, `result_count`, `results`, `path_groups`, `orphan_count`, `orphans`, `orphan_memberships`, `index_staleness`, …
+- **list** — `paths`, `path_count`, `tree`, `prefix`
+- **remove** — `removed`
+- **compact** — `annotations_updated`
 
 ### sum [--top-links N]
 
-Bounded overview; **`links_top`** counts components per path using the **same merged** membership as `lime link` / search tokens (not annotations alone).
+Bounded overview; **`links_top`** counts components per path using the **same merged** membership as `lime links show` / search tokens (not annotations alone).
 
 ### config {show|diagnostics|death-seeds|index}
 
@@ -209,6 +204,6 @@ Usage Scenarios:
 'lime sync' for codebase indexation
 'lime list -a --json' to retrieve all components
 'lime show {componentID}' to show the component content, attached annotations for context
-'lime link {path-or-prefix}' — components via merged link store + annotations; `lime links add|list` for CRUD on `.lime/component_links.json`
+'lime links show {path-or-prefix}' — components via merged link store + annotations; 'lime links list|add|remove|compact' for paths and '.lime/component_links.json'
 
 

@@ -67,7 +67,6 @@ pub fn run() -> Result<()> {
             terms,
             fuzzy,
         } => handle_search(root, terms, fuzzy),
-        Commands::Link { label, notes } => handle_link(root, label, notes),
         Commands::Links { action } => handle_links(root, action),
         Commands::Sum { top_links } => handle_sum(root, top_links),
         Commands::List {
@@ -131,8 +130,8 @@ fn exit_error(message: &str, json_mode: bool) -> ! {
   lime list rust                 Show Rust component counts
   lime list rust --all           List all Rust components
   lime deps fn-61bcc6dabec3f308  Show dependency matrix
-  lime link auth                 Components in link path auth (store + annotations)
-  lime links add fn-abc auth     Add membership in .lime/component_links.json
+  lime links show auth           Components matching link path auth (merged store + annotations)
+  lime links list                All link paths; lime links add <id> <path> to assign
   lime sum                       Bounded overview (counts, links, staleness)"#
 )]
 struct Cli {
@@ -206,33 +205,23 @@ enum Commands {
         #[arg(long)]
         fuzzy: bool,
     },
-    /// List components that share a link path (topic / pipeline).
+    /// Link paths: query members, list paths, or edit `.lime/component_links.json`.
     ///
-    /// Membership comes from `.lime/component_links.json` merged with annotation
-    /// `links` (see `lime links`). Matching is prefix-aware: query `auth` matches
-    /// `auth` and `auth/login`. Add `--notes` to include full annotation bodies.
+    /// All link operations use one subcommand group:
+    /// - **show** — components whose merged paths match a path or prefix (`auth` matches `auth/login`).
+    /// - **list** — distinct paths (`--tree` indents by `/` depth).
+    /// - **add** / **remove** — membership without editing annotation prose.
+    /// - **compact** — drop duplicate `links` lines from annotations when the store already has the path.
     ///
-    /// Examples:
-    ///   "lime link auth"
-    ///   "lime link auth/login"
-    ///   "lime link auth --notes"
-    Link {
-        /// Link path or prefix to match (e.g. `auth`, `auth/login`).
-        label: String,
-        /// Include full annotation markdown in each result.
-        #[arg(long)]
-        notes: bool,
-    },
-    /// Manage link path memberships in `.lime/component_links.json`.
-    ///
-    /// Use `lime links add` / `remove` without touching annotation prose.
-    /// `lime link` queries merged memberships (store + annotation links).
+    /// Membership is merged from `.lime/component_links.json` and annotation frontmatter `links`.
     ///
     /// Examples:
-    ///   "lime links add fn-abc123 auth/login"
-    ///   "lime links remove fn-abc123 auth/login"
+    ///   "lime links show auth"
+    ///   "lime links show auth/login --notes"
     ///   "lime links list"
     ///   "lime links list auth --tree"
+    ///   "lime links add fn-abc123 auth/login"
+    ///   "lime links remove fn-abc123 auth/login"
     ///   "lime links compact"
     Links {
         #[command(subcommand)]
@@ -338,6 +327,28 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum LinksAction {
+    /// List components whose merged link paths match this path or prefix (store + annotations).
+    ///
+    /// Prefix match: `auth` matches `auth` and `auth/login`. Use `--notes` for full annotation bodies.
+    ///
+    /// Examples:
+    ///   "lime links show auth"
+    ///   "lime links show auth/oauth --notes"
+    Show {
+        /// Link path or prefix (e.g. `auth`, `auth/login`).
+        path: String,
+        /// Include full annotation markdown in each result.
+        #[arg(long)]
+        notes: bool,
+    },
+    /// List distinct link paths across the project (merged store + annotations).
+    List {
+        /// Only paths equal to or under this prefix (case-insensitive).
+        prefix: Option<String>,
+        /// Indent paths by `/` depth for terminal output.
+        #[arg(long)]
+        tree: bool,
+    },
     /// Add a link path for a component (writes `.lime/component_links.json`).
     Add {
         /// Component ID (from `lime search` or `lime list --all`).
@@ -349,14 +360,6 @@ enum LinksAction {
     Remove {
         component_id: String,
         path: String,
-    },
-    /// List distinct link paths across the project (merged store + annotations).
-    List {
-        /// Only paths equal to or under this prefix (case-insensitive).
-        prefix: Option<String>,
-        /// Indent paths by `/` depth for terminal output.
-        #[arg(long)]
-        tree: bool,
     },
     /// Drop duplicate `links` from annotation files when the path exists in the link store.
     Compact,
@@ -1128,12 +1131,12 @@ fn json_for_link_result(
 }
 
 fn handle_links(root: PathBuf, action: LinksAction) -> Result<Value> {
-    let config = LimeConfig::load_or_create(&root)?;
-    let timer = std::time::Instant::now();
-    let index = storage::load_index_or_empty(&root, &config)?;
-
-    let response = match action {
+    match action {
+        LinksAction::Show { path, notes } => handle_link(root, path, notes),
         LinksAction::Add { component_id, path } => {
+            let config = LimeConfig::load_or_create(&root)?;
+            let timer = std::time::Instant::now();
+            let index = storage::load_index_or_empty(&root, &config)?;
             index
                 .components
                 .iter()
@@ -1141,27 +1144,41 @@ fn handle_links(root: PathBuf, action: LinksAction) -> Result<Value> {
                 .ok_or_else(|| anyhow!("component not found: {component_id}"))?;
             links::add_membership(&root, &component_id, &path)?;
             persist_token_index(&root, &index);
-            json!({
+            let mut out = json!({
                 "ok": true,
                 "command": "links",
                 "action": "add",
                 "component_id": component_id,
                 "path": path.trim(),
-            })
+            });
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("elapsed_secs".into(), json!(timer.elapsed().as_secs_f64()));
+            }
+            Ok(out)
         }
         LinksAction::Remove { component_id, path } => {
+            let config = LimeConfig::load_or_create(&root)?;
+            let timer = std::time::Instant::now();
+            let index = storage::load_index_or_empty(&root, &config)?;
             let removed = links::remove_membership(&root, &component_id, &path)?;
             persist_token_index(&root, &index);
-            json!({
+            let mut out = json!({
                 "ok": true,
                 "command": "links",
                 "action": "remove",
                 "component_id": component_id,
                 "path": path.trim(),
                 "removed": removed,
-            })
+            });
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("elapsed_secs".into(), json!(timer.elapsed().as_secs_f64()));
+            }
+            Ok(out)
         }
         LinksAction::List { prefix, tree } => {
+            let config = LimeConfig::load_or_create(&root)?;
+            let timer = std::time::Instant::now();
+            let index = storage::load_index_or_empty(&root, &config)?;
             let all_annotations = annotations::list_annotations(&root).unwrap_or_default();
             let paths = links::distinct_merged_paths(
                 &root,
@@ -1169,7 +1186,7 @@ fn handle_links(root: PathBuf, action: LinksAction) -> Result<Value> {
                 &all_annotations,
                 prefix.as_deref(),
             );
-            json!({
+            let mut out = json!({
                 "ok": true,
                 "command": "links",
                 "action": "list",
@@ -1177,29 +1194,30 @@ fn handle_links(root: PathBuf, action: LinksAction) -> Result<Value> {
                 "prefix": prefix,
                 "path_count": paths.len(),
                 "paths": paths,
-            })
+            });
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("elapsed_secs".into(), json!(timer.elapsed().as_secs_f64()));
+            }
+            Ok(out)
         }
         LinksAction::Compact => {
+            let config = LimeConfig::load_or_create(&root)?;
+            let timer = std::time::Instant::now();
+            let index = storage::load_index_or_empty(&root, &config)?;
             let updated = links::compact_annotation_links(&root, &index)?;
             persist_token_index(&root, &index);
-            json!({
+            let mut out = json!({
                 "ok": true,
                 "command": "links",
                 "action": "compact",
                 "annotations_updated": updated,
-            })
+            });
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("elapsed_secs".into(), json!(timer.elapsed().as_secs_f64()));
+            }
+            Ok(out)
         }
-    };
-
-    let elapsed = timer.elapsed();
-    let mut out = response;
-    if let Some(obj) = out.as_object_mut() {
-        obj.insert(
-            "elapsed_secs".into(),
-            json!(elapsed.as_secs_f64()),
-        );
     }
-    Ok(out)
 }
 
 fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
@@ -1366,7 +1384,8 @@ fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
     let orphan_count = orphans.len() + orphan_memberships.len();
     Ok(json!({
         "ok": true,
-        "command": "link",
+        "command": "links",
+        "action": "show",
         "link": q,
         "notes": notes,
         "result_count": results.len(),

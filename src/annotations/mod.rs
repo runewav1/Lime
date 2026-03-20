@@ -26,7 +26,7 @@ pub struct Annotation {
     pub content: String,
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Link paths (`/` segments); merged with `.lime/component_links.json` for `lime link` / search.
+    /// Link paths (`/` segments); merged with `.lime/component_links.json` for `lime links show` / search.
     #[serde(default)]
     pub links: Vec<String>,
     pub created_at: String,

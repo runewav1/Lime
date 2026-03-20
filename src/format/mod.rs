@@ -105,7 +105,13 @@ pub fn render(payload: &Value) -> String {
         "remove" => render_remove(payload, &s),
         "search" => render_search(payload, &s),
         "link" => render_link(payload, &s),
-        "links" => render_links_cmd(payload, &s),
+        "links" => {
+            if payload.get("action").and_then(Value::as_str) == Some("show") {
+                render_link(payload, &s)
+            } else {
+                render_links_cmd(payload, &s)
+            }
+        },
         "sum" => render_sum(payload, &s),
         "list" => render_list(payload, &s),
         "deps" => render_deps(payload, &s),
@@ -419,9 +425,10 @@ fn render_link(v: &Value, s: &Style) -> String {
 
     let _ = writeln!(
         out,
-        "{} {}",
-        s.bold("link:"),
-        s.cyan(&link_label)
+        "{} {} {}",
+        s.bold("links show:"),
+        s.cyan(&link_label),
+        s.dim("(merged store + annotations)")
     );
     if notes {
         let _ = writeln!(out, "{}", s.dim("(with full annotation notes)"));
