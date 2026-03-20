@@ -176,17 +176,17 @@ fn render_sync(v: &Value, s: &Style) -> String {
         }
     } else if scope == "partial" {
         let sync_mode = str_val(v, "sync_mode");
-        if sync_mode == "git_partial" {
-            let _ = writeln!(
-                out,
-                "{}",
-                s.dim("Git partial sync (dirty paths → re-indexed files)")
-            );
-        }
         if let Some(result) = v.get("result") {
             write_file_result(&mut out, result, s);
         }
-        write_index_summary(&mut out, v, s, true);
+        if sync_mode == "git_partial" {
+            if let Some(delta) = v.get("sync_delta") {
+                write_git_partial_sync_delta(&mut out, delta, s);
+            }
+            write_git_partial_index_totals(&mut out, v, s, true);
+        } else {
+            write_index_summary(&mut out, v, s, true);
+        }
         if verbose {
             if let Some(idx) = v.get("index") {
                 write_component_breakdown(&mut out, idx, s);
@@ -1477,6 +1477,117 @@ fn render_registry(v: &Value, s: &Style) -> String {
 }
 
 // ── shared formatting helpers ───────────────────────────────────
+
+/// Git partial: summarize new vs re-indexed files and list component ID deltas (JSON `sync_delta`).
+fn write_git_partial_sync_delta(out: &mut String, d: &Value, s: &Style) {
+    const MAX_IDS: usize = 32;
+    let new_n = d
+        .get("files_new_to_index")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let re_n = d
+        .get("files_reindexed")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if new_n > 0 || re_n > 0 {
+        let _ = writeln!(
+            out,
+            "  {} {} new to index, {} re-indexed {}",
+            s.bold("Files this sync:"),
+            s.bold_green(&new_n.to_string()),
+            s.cyan(&re_n.to_string()),
+            s.dim("(paths marked + above)")
+        );
+    }
+
+    let add_count = d
+        .get("components_added_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let rem_count = d
+        .get("components_removed_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let added = str_array(d, "components_added");
+    let removed = str_array(d, "components_removed");
+
+    if add_count == 0 && rem_count == 0 {
+        let _ = writeln!(
+            out,
+            "  {} {}",
+            s.bold("Components this sync:"),
+            s.dim("no additional components found (net new/removed IDs; file content may still have been refreshed)")
+        );
+        return;
+    }
+
+    let _ = writeln!(out, "  {}", s.bold("Components this sync:"));
+    if add_count > 0 {
+        let _ = write!(out, "    {} +{}: ", s.green("+"), add_count);
+        for (i, id) in added.iter().take(MAX_IDS).enumerate() {
+            if i > 0 {
+                let _ = write!(out, ", ");
+            }
+            let _ = write!(out, "{}", s.green(id));
+        }
+        if added.len() > MAX_IDS {
+            let _ = write!(
+                out,
+                " {}",
+                s.dim(&format!("… +{} more", added.len() - MAX_IDS))
+            );
+        }
+        let _ = writeln!(out);
+    }
+    if rem_count > 0 {
+        let _ = write!(out, "    {} -{}: ", s.red("-"), rem_count);
+        for (i, id) in removed.iter().take(MAX_IDS).enumerate() {
+            if i > 0 {
+                let _ = write!(out, ", ");
+            }
+            let _ = write!(out, "{}", s.red(id));
+        }
+        if removed.len() > MAX_IDS {
+            let _ = write!(
+                out,
+                " {}",
+                s.dim(&format!("… +{} more", removed.len() - MAX_IDS))
+            );
+        }
+        let _ = writeln!(out);
+    }
+}
+
+/// After git partial sync: full index totals (not the per-sync delta).
+fn write_git_partial_index_totals(out: &mut String, v: &Value, s: &Style, include_batman: bool) {
+    let Some(idx) = v.get("index") else {
+        return;
+    };
+    let files = num_val(idx, "file_count");
+    let components = num_val(idx, "component_count");
+    let batman_count = num_val(idx, "batman_count");
+    let batman_suffix = if include_batman && batman_count > 0 {
+        format!(" {}", s.bold_red(&format!("[{batman_count} dead]")))
+    } else {
+        String::new()
+    };
+    let timing = v
+        .get("elapsed_secs")
+        .and_then(Value::as_f64)
+        .map(|e| format!(" in {}", s.dim(&format_duration(e))))
+        .unwrap_or_default();
+    let _ = writeln!(
+        out,
+        "{} {files} file{}, {components} component{}{}{}",
+        s.bold("Index totals:"),
+        plural(files),
+        plural(components),
+        batman_suffix,
+        timing
+    );
+}
 
 fn write_file_result(out: &mut String, result: &Value, s: &Style) {
     let indexed = str_array(result, "indexed");

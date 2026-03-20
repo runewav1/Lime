@@ -39,19 +39,11 @@ pub struct LimeConfig {
 
 /// When `empty_sync_uses_git` is true, `lime sync` with no file arguments runs partial sync
 /// on paths reported by `git status --porcelain` (unless overridden by `--no-git` / `--git`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GitPartialSyncConfig {
     /// If true, `lime sync` with no paths uses git working-tree changes for partial indexing.
     pub empty_sync_uses_git: bool,
-}
-
-impl Default for GitPartialSyncConfig {
-    fn default() -> Self {
-        Self {
-            empty_sync_uses_git: false,
-        }
-    }
 }
 
 /// Controls which components are treated as alive seeds in death detection.
@@ -209,7 +201,7 @@ impl LimeConfig {
         }
     }
 
-    fn ensure_default_ignores(&mut self) {
+    pub(crate) fn ensure_default_ignores(&mut self) {
         for required in [".git/", "node_modules/", "target/", ".lime/", ".lemon/"] {
             if !self.ignore_patterns.iter().any(|value| value == required) {
                 self.ignore_patterns.push(required.to_string());

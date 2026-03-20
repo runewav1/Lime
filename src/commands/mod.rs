@@ -16,7 +16,7 @@ use crate::{
     deps,
     diagnostics,
     git_staleness,
-    index::{self, ComponentRecord, DeathStatus, IndexData},
+    index::{self, ComponentRecord, DeathStatus, FileUpdateResult, IndexData},
     links,
     projects_registry,
     search::{self, MatchType},
@@ -462,7 +462,11 @@ enum Commands {
     /// Examples:
     ///   "lime config show"
     ///   "lime config --global show"
-    ///   "lime config --global diagnostics --enabled true"
+    ///   "lime config --global git-partial-sync --git-empty-sync true"
+    ///   "lime config diagnostics --enabled true --timeout 120"
+    ///   "lime config dependency-depth --depth 3"
+    ///   "lime config ignores --add vendor/"
+    ///   "lime config index-storage --path .lime/index.json"
     ///   "lime config death-seeds --seed-file src/main.rs --seed-name main --seed-type fn"
     Config {
         #[command(subcommand)]
@@ -682,10 +686,54 @@ enum ConfigAction {
     /// Examples:
     ///   "lime config git-partial-sync"
     ///   "lime config git-partial-sync --use-git-for-empty-sync true"
+    ///   "lime config git-partial-sync --git-empty-sync true"
     GitPartialSync {
         /// Use `git status` dirty paths for empty `lime sync` (omit to only show current value).
-        #[arg(long = "use-git-for-empty-sync")]
+        #[arg(
+            long = "use-git-for-empty-sync",
+            visible_alias = "git-empty-sync"
+        )]
         use_git_for_empty_sync: Option<bool>,
+    },
+
+    /// Default maximum depth for `lime deps` when `--depth` is omitted.
+    ///
+    /// Examples:
+    ///   "lime config dependency-depth"           show current value
+    ///   "lime config dependency-depth --depth 4" set value
+    DependencyDepth {
+        /// New default dependency depth (≥ 0).
+        #[arg(long)]
+        depth: Option<usize>,
+    },
+
+    /// Add or remove extra ignore patterns (in addition to `.gitignore`).
+    ///
+    /// Required defaults (`.git/`, `node_modules/`, etc.) are re-applied on load; you can remove
+    /// user-added entries with `--remove`.
+    ///
+    /// Examples:
+    ///   "lime config ignores"                       show patterns
+    ///   "lime config ignores --add dist/"
+    ///   "lime config ignores --add build/ --remove old_tmp/"
+    Ignores {
+        /// Append a glob-style ignore pattern (repeatable).
+        #[arg(long)]
+        add: Vec<String>,
+        /// Remove a pattern if present (exact match; repeatable).
+        #[arg(long)]
+        remove: Vec<String>,
+    },
+
+    /// Set or show the index JSON path (`index_storage` in config).
+    ///
+    /// Examples:
+    ///   "lime config index-storage"                    show current path
+    ///   "lime config index-storage --path .lime/index.json"
+    IndexStorage {
+        /// Relative or absolute path for the index file.
+        #[arg(long)]
+        path: Option<String>,
     },
 }
 
@@ -796,6 +844,41 @@ fn handle_sum(root: PathBuf, top_links: usize) -> Result<Value> {
         },
         "index_pretty": config.index_pretty,
     }))
+}
+
+/// Per-sync diff for git partial (and agents): new vs re-indexed files, component IDs added/removed.
+fn sync_delta_json(
+    ids_before: &HashSet<String>,
+    paths_before: &HashSet<String>,
+    after: &IndexData,
+    result: &FileUpdateResult,
+) -> Value {
+    let ids_after: HashSet<String> = after.components.iter().map(|c| c.id.clone()).collect();
+    let mut components_added: Vec<String> = ids_after.difference(ids_before).cloned().collect();
+    let mut components_removed: Vec<String> = ids_before.difference(&ids_after).cloned().collect();
+    components_added.sort();
+    components_removed.sort();
+    let mut files_new_to_index: Vec<String> = Vec::new();
+    let mut files_reindexed: Vec<String> = Vec::new();
+    for p in &result.indexed {
+        if paths_before.contains(p) {
+            files_reindexed.push(p.clone());
+        } else {
+            files_new_to_index.push(p.clone());
+        }
+    }
+    files_new_to_index.sort();
+    files_reindexed.sort();
+
+    json!({
+        "components_added": components_added,
+        "components_removed": components_removed,
+        "components_added_count": components_added.len(),
+        "components_removed_count": components_removed.len(),
+        "files_new_to_index": files_new_to_index,
+        "files_reindexed": files_reindexed,
+        "files_touched_count": result.indexed.len(),
+    })
 }
 
 fn handle_sync(
@@ -977,7 +1060,10 @@ fn handle_sync(
         return Ok(response);
     }
 
+    let ids_before: HashSet<String> = current.components.iter().map(|c| c.id.clone()).collect();
+    let paths_before: HashSet<String> = current.files.iter().map(|f| f.path.clone()).collect();
     let (mut updated, result) = index::sync_files(&root, &config, &to_sync, current)?;
+    let sync_delta = sync_delta_json(&ids_before, &paths_before, &updated, &result);
     let diag_result = run_and_attach_diagnostics(&root, &mut updated, do_diag);
     let elapsed = timer.elapsed();
     git_staleness::refresh_git_head_at_sync(&mut updated, &root);
@@ -994,6 +1080,7 @@ fn handle_sync(
             "candidates": candidate_count,
             "sync_paths": to_sync,
         },
+        "sync_delta": sync_delta,
         "result": result,
         "index": index_payload_with_staleness(&root, &updated)
     });
@@ -1136,13 +1223,22 @@ fn handle_config(root: PathBuf, action: ConfigAction, global: bool) -> Result<Va
         }
         ConfigAction::Diagnostics { enabled, timeout } => {
             let mut config = load(&root)?;
+            let changed = enabled.is_some() || timeout.is_some();
             if let Some(value) = enabled {
                 config.diagnostics.enabled = value;
             }
             if let Some(value) = timeout {
                 config.diagnostics.timeout_secs = value;
             }
-            let config_path = save(&config, &root)?;
+            let config_path = if changed {
+                save(&config, &root)?
+            } else if global {
+                LimeConfig::global_config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string())
+            } else {
+                LimeConfig::config_path(&root).display().to_string()
+            };
             let diag = config.diagnostics.clone();
             Ok(json!({
                 "ok": true,
@@ -1150,6 +1246,7 @@ fn handle_config(root: PathBuf, action: ConfigAction, global: bool) -> Result<Va
                 "global": global,
                 "config_path": config_path,
                 "diagnostics": diag,
+                "updated": changed,
             }))
         }
         ConfigAction::DeathSeeds {
@@ -1161,6 +1258,13 @@ fn handle_config(root: PathBuf, action: ConfigAction, global: bool) -> Result<Va
             clear_seed_types,
         } => {
             let mut config = load(&root)?;
+
+            let changed = clear_seed_files
+                || clear_seed_names
+                || clear_seed_types
+                || !seed_files.is_empty()
+                || !seed_names.is_empty()
+                || !seed_types.is_empty();
 
             if clear_seed_files {
                 config.death_seeds.seed_files.clear();
@@ -1194,7 +1298,15 @@ fn handle_config(root: PathBuf, action: ConfigAction, global: bool) -> Result<Va
                 }
             }
 
-            let config_path = save(&config, &root)?;
+            let config_path = if changed {
+                save(&config, &root)?
+            } else if global {
+                LimeConfig::global_config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string())
+            } else {
+                LimeConfig::config_path(&root).display().to_string()
+            };
             let seeds = config.death_seeds.clone();
 
             Ok(json!({
@@ -1203,6 +1315,7 @@ fn handle_config(root: PathBuf, action: ConfigAction, global: bool) -> Result<Va
                 "global": global,
                 "config_path": config_path,
                 "death_seeds": seeds,
+                "updated": changed,
             }))
         }
         ConfigAction::Index { pretty } => {
@@ -1250,6 +1363,99 @@ fn handle_config(root: PathBuf, action: ConfigAction, global: bool) -> Result<Va
                 "global": global,
                 "config_path": config_path,
                 "empty_sync_uses_git": config.git_partial_sync.empty_sync_uses_git,
+                "updated": updated,
+            }))
+        }
+        ConfigAction::DependencyDepth { depth } => {
+            let mut config = load(&root)?;
+            let updated = depth.is_some();
+            if let Some(d) = depth {
+                config.default_dependency_depth = d;
+                let _ = save(&config, &root)?;
+            }
+            let config_path = if global {
+                LimeConfig::global_config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string())
+            } else {
+                LimeConfig::config_path(&root).display().to_string()
+            };
+            Ok(json!({
+                "ok": true,
+                "command": "config_dependency_depth",
+                "global": global,
+                "config_path": config_path,
+                "default_dependency_depth": config.default_dependency_depth,
+                "updated": updated,
+            }))
+        }
+        ConfigAction::Ignores { add, remove } => {
+            let mut config = load(&root)?;
+            let mut changed = false;
+            for pattern in add {
+                let p = pattern.trim().to_string();
+                if p.is_empty() {
+                    continue;
+                }
+                if !config.ignore_patterns.contains(&p) {
+                    config.ignore_patterns.push(p);
+                    changed = true;
+                }
+            }
+            for pattern in remove {
+                let p = pattern.trim();
+                if p.is_empty() {
+                    continue;
+                }
+                let before = config.ignore_patterns.len();
+                config.ignore_patterns.retain(|x| x != p);
+                if config.ignore_patterns.len() != before {
+                    changed = true;
+                }
+            }
+            config.ensure_default_ignores();
+            let config_path = if changed {
+                save(&config, &root)?
+            } else if global {
+                LimeConfig::global_config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string())
+            } else {
+                LimeConfig::config_path(&root).display().to_string()
+            };
+            Ok(json!({
+                "ok": true,
+                "command": "config_ignores",
+                "global": global,
+                "config_path": config_path,
+                "ignore_patterns": config.ignore_patterns,
+                "updated": changed,
+            }))
+        }
+        ConfigAction::IndexStorage { path } => {
+            let mut config = load(&root)?;
+            let updated = path.is_some();
+            if let Some(p) = path {
+                let trimmed = p.trim();
+                if trimmed.is_empty() {
+                    bail!("index-storage --path must not be empty");
+                }
+                config.index_storage = trimmed.to_string();
+                let _ = save(&config, &root)?;
+            }
+            let config_path = if global {
+                LimeConfig::global_config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string())
+            } else {
+                LimeConfig::config_path(&root).display().to_string()
+            };
+            Ok(json!({
+                "ok": true,
+                "command": "config_index_storage",
+                "global": global,
+                "config_path": config_path,
+                "index_storage": config.index_storage,
                 "updated": updated,
             }))
         }

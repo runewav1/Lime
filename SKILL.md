@@ -41,7 +41,7 @@ lime --json sync --diagnostics            # attach static-analyzer faults
 lime --json sync -v                       # verbose breakdown
 ```
 
-**JSON (selected):** `sync_mode`: `full` | `git_partial` | `noop` | `partial`; optional `git_partial: { candidates, sync_paths }`, `git_partial_fallback`.
+**JSON (selected):** `sync_mode`: `full` | `git_partial` | `noop` | `partial`; optional `git_partial: { candidates, sync_paths }`, `git_partial_fallback`. When `sync_mode` is **`git_partial`**, responses include **`sync_delta`**: `components_added` / `components_removed` (IDs), counts, `files_new_to_index` vs `files_reindexed`, and `files_touched_count`. A content-only refresh can yield **zero net component IDs** while files still appear under `result.indexed` / `files_reindexed`—human output reports *“no additional components found”* for that case.
 
 ### add <filepath>
 Add/refresh a single file. Returns `{ok, command:"add", elapsed_secs, request:{filename}, result, index}`.
@@ -197,7 +197,23 @@ Safety policy (foreign repository target):
 | `annotate remove` | Blocked |
 | `sync`, `add`, `remove`, `links add/remove/compact`, `config`, `registry` | Blocked |
 
-### config {show|diagnostics|death-seeds|index|git-partial-sync} [--global]
+### config … [--global]
+
+**All** `lime config <subcommand>` actions support **`--global`** on the `config` command (same flags, writes `~/.config/lime/lime.json` / Windows `%APPDATA%\lime\lime.json`). Omit `--global` for **project** `.lime/lime.json`.
+
+You can set values entirely from the terminal—no editor required. Subcommands that take optional flags typically **show** current values when flags are omitted and **write** when you pass a new value.
+
+| Config key | CLI (project) | CLI (global template) |
+|------------|---------------|------------------------|
+| *(full dump)* | `lime config show` | `lime config --global show` |
+| `diagnostics.*` | `lime config diagnostics --enabled true --timeout 60` | add `--global` |
+| `death_seeds.*` | `lime config death-seeds --seed-file …` | add `--global` |
+| `index_pretty` | `lime config index --pretty false` | add `--global` |
+| `git_partial_sync.empty_sync_uses_git` | `lime config git-partial-sync --use-git-for-empty-sync true` | add `--global` |
+| | Alias: `--git-empty-sync true` | |
+| `default_dependency_depth` | `lime config dependency-depth --depth 3` | add `--global` |
+| `ignore_patterns` | `lime config ignores --add dist/ --remove tmp/` | add `--global` |
+| `index_storage` | `lime config index-storage --path .lime/index.json` | add `--global` |
 
 ```bash
 lime --json config show
@@ -205,18 +221,21 @@ lime --json config diagnostics --enabled true --timeout 60
 lime --json config death-seeds --seed-file "src/main.rs" --seed-name "main" --seed-type "fn"
 lime --json config death-seeds --clear-seed-files   # clear before adding
 lime --json config index --pretty false              # compact JSON writes
-lime --json config git-partial-sync                 # show empty_sync_uses_git
-lime --json config git-partial-sync --use-git-for-empty-sync true
+lime --json config git-partial-sync                  # show empty_sync_uses_git
+lime --json config git-partial-sync --git-empty-sync true
+lime --json config dependency-depth --depth 4
+lime --json config ignores --add "vendor/"
+lime --json config index-storage --path .lime/index.json
 
-# --global flag operates on the global config instead of the project config:
+# Global template (new projects seed from this when .lime/lime.json is created):
 lime --json config --global show
 lime --json config --global diagnostics --enabled true
-lime --json config --global git-partial-sync --use-git-for-empty-sync true
+lime --json config --global git-partial-sync --git-empty-sync true
 ```
 
 death-seeds flags: `--seed-file <pattern>`, `--seed-name <name>`, `--seed-type <type>`, `--clear-seed-files`, `--clear-seed-names`, `--clear-seed-types`.
 
-**JSON:** adds `"global": bool` and `"config_path": "<abs path>"` to all config responses.
+**JSON:** `"global": bool`, `"config_path": "<abs path>"`, and `"updated": bool` where applicable (false when no file was written).
 
 ## Global Config (`~/.config/lime/lime.json`)
 
