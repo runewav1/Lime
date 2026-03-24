@@ -7,19 +7,94 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     annotations::{self, Annotation},
-    index::IndexData,
+    config::LimeConfig,
+    index::{ComponentRecord, IndexData},
+    storage,
 };
 
 /// Maximum length of a single link path string (chars).
 pub const MAX_LINK_PATH_LEN: usize = 256;
 /// Maximum number of distinct link paths per component.
 pub const MAX_PATHS_PER_COMPONENT: usize = 128;
+
+/// Parsed link path: local topic segments or scoped `@project_id/topic…`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkPath {
+    Local(String),
+    Scoped { project_id: String, tail: String },
+}
+
+/// Parse link path syntax (local or `@id/tail`). Does not check the projects registry.
+pub fn parse_link_path(raw: &str) -> Result<LinkPath> {
+    let s = raw.trim();
+    if s.is_empty() {
+        bail!("link path must not be empty");
+    }
+    if s.len() > MAX_LINK_PATH_LEN {
+        bail!("link path exceeds max length ({MAX_LINK_PATH_LEN})");
+    }
+    if s.starts_with('@') {
+        let rest = s
+            .strip_prefix('@')
+            .filter(|r| !r.is_empty())
+            .ok_or_else(|| anyhow!("scoped link path must be @<project_id>/<topic>"))?;
+        let (project_id, tail) = rest.split_once('/').ok_or_else(|| {
+            anyhow!(
+                "scoped link path must be @<project_id>/<topic> (missing '/' after project id)"
+            )
+        })?;
+        if project_id.trim().is_empty() {
+            bail!("scoped link path project id must not be empty");
+        }
+        validate_project_id_segment(project_id)?;
+        validate_path_tail(tail)?;
+        return Ok(LinkPath::Scoped {
+            project_id: project_id.to_string(),
+            tail: tail.to_string(),
+        });
+    }
+    validate_path_tail(s)?;
+    Ok(LinkPath::Local(s.to_string()))
+}
+
+fn validate_project_id_segment(seg: &str) -> Result<()> {
+    if seg.contains('/') {
+        bail!("project id must not contain '/'");
+    }
+    if seg.trim().is_empty() {
+        bail!("project id must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_path_tail(s: &str) -> Result<()> {
+    if s.starts_with('/') || s.ends_with('/') {
+        bail!("link path must not start or end with '/'");
+    }
+    if s.contains("//") {
+        bail!("link path must not contain empty segments ('//')");
+    }
+    for seg in s.split('/') {
+        if seg.trim().is_empty() {
+            bail!("link path segments must be non-empty");
+        }
+    }
+    Ok(())
+}
+
+/// Normalize a stored path for merge/display: valid local or syntactically valid scoped (registry not required).
+pub fn normalize_link_path_for_merge(raw: &str) -> Option<String> {
+    parse_link_path(raw).ok().map(|p| match p {
+        LinkPath::Local(s) => s,
+        LinkPath::Scoped { project_id, tail } => format!("@{}/{}", project_id, tail),
+    })
+}
 
 pub fn component_links_path(root: &Path) -> PathBuf {
     root.join(".lime").join("component_links.json")
@@ -70,27 +145,90 @@ pub struct LinkCatalogFile {
     pub entries: HashMap<String, LinkCatalogEntry>,
 }
 
-/// Validate and normalize a link path: non-empty segments, `/` delimiter, no `//`, trimmed.
+/// Validate and normalize a link path (local or scoped). Scoped paths require a registered `project_id`.
 pub fn validate_link_path(raw: &str) -> Result<String> {
-    let s = raw.trim();
-    if s.is_empty() {
-        bail!("link path must not be empty");
-    }
-    if s.len() > MAX_LINK_PATH_LEN {
-        bail!("link path exceeds max length ({MAX_LINK_PATH_LEN})");
-    }
-    if s.starts_with('/') || s.ends_with('/') {
-        bail!("link path must not start or end with '/'");
-    }
-    if s.contains("//") {
-        bail!("link path must not contain empty segments ('//')");
-    }
-    for seg in s.split('/') {
-        if seg.trim().is_empty() {
-            bail!("link path segments must be non-empty");
+    match parse_link_path(raw)? {
+        LinkPath::Local(s) => Ok(s),
+        LinkPath::Scoped { project_id, tail } => {
+            if !crate::projects_registry::is_registered(&project_id) {
+                bail!(
+                    "unknown project id `{}`; run `lime registry add` to register the project root",
+                    project_id
+                );
+            }
+            Ok(format!("@{}/{}", project_id, tail))
         }
     }
-    Ok(s.to_string())
+}
+
+/// True if `query` is a scoped link query (`@project_id/...`).
+pub fn link_query_is_scoped(query: &str) -> bool {
+    query.trim().starts_with('@')
+}
+
+/// Split a scoped query like `@tokio/auth/sub` into project id and tail for peer matching (`auth/sub`).
+pub fn split_scoped_query(query: &str) -> Option<(String, String)> {
+    let q = query.trim();
+    if !q.starts_with('@') {
+        return None;
+    }
+    let rest = q.strip_prefix('@')?;
+    let (pid, tail) = rest.split_once('/')?;
+    if pid.is_empty() || tail.is_empty() {
+        return None;
+    }
+    Some((pid.to_string(), tail.to_string()))
+}
+
+/// Components in `peer_root` whose merged **local** link paths (not starting with `@`) match `tail_query`
+/// as a path or prefix (`links::path_matches_link_query`). Used for `lime links show @peer/tail --peer-resolve`.
+pub fn peer_local_link_matches(
+    peer_root: &Path,
+    tail_query: &str,
+) -> Result<Vec<(ComponentRecord, Vec<String>)>> {
+    let tq = tail_query.trim();
+    if tq.is_empty() {
+        return Ok(Vec::new());
+    }
+    let config = LimeConfig::load_or_create(peer_root)?;
+    let index = storage::load_index_or_empty(peer_root, &config)?;
+    let annotations = annotations::list_annotations(peer_root).unwrap_or_default();
+    let merged = merged_link_paths_by_component(peer_root, &index, &annotations);
+    let mut out: Vec<(ComponentRecord, Vec<String>)> = Vec::new();
+    for (cid, paths) in merged {
+        let mut matched: Vec<String> = Vec::new();
+        for p in &paths {
+            if p.starts_with('@') {
+                continue;
+            }
+            if path_matches_link_query(p, tq) {
+                matched.push(p.clone());
+            }
+        }
+        if matched.is_empty() {
+            continue;
+        }
+        let Some(comp) = index.components.iter().find(|c| c.id == cid) else {
+            continue;
+        };
+        matched.sort_by_key(|a| a.to_ascii_lowercase());
+        out.push((comp.clone(), matched));
+    }
+    out.sort_by(|a, b| {
+        (
+            a.0.file.as_str(),
+            a.0.start_line,
+            a.0.name.as_str(),
+            a.0.id.as_str(),
+        )
+            .cmp(&(
+                b.0.file.as_str(),
+                b.0.start_line,
+                b.0.name.as_str(),
+                b.0.id.as_str(),
+            ))
+    });
+    Ok(out)
 }
 
 pub fn load_component_links(root: &Path) -> Result<ComponentLinksFile> {
@@ -188,7 +326,7 @@ pub fn merged_link_paths_by_component(
     for (cid, paths) in store.memberships {
         let mut v = Vec::new();
         for p in paths {
-            if let Ok(n) = validate_link_path(&p) {
+            if let Some(n) = normalize_link_path_for_merge(&p) {
                 v.push(n);
             }
         }
@@ -205,7 +343,7 @@ pub fn merged_link_paths_by_component(
         let entry = acc.entry(comp.id.clone()).or_default();
         let mut combined: Vec<String> = entry.clone();
         for l in &ann.links {
-            if let Ok(n) = validate_link_path(l) {
+            if let Some(n) = normalize_link_path_for_merge(l) {
                 combined.push(n);
             }
         }
@@ -300,7 +438,7 @@ pub fn distinct_merged_paths(
     }
     for ann in annotations {
         for l in &ann.links {
-            if let Ok(n) = validate_link_path(l) {
+            if let Some(n) = normalize_link_path_for_merge(l) {
                 set.insert(n);
             }
         }
@@ -371,5 +509,45 @@ mod tests {
         assert!(path_matches_link_query("auth/login", "auth"));
         assert!(path_matches_link_query("auth", "auth"));
         assert!(!path_matches_link_query("oauth", "auth"));
+    }
+
+    #[test]
+    fn parse_link_path_scoped_ok() {
+        match parse_link_path("@tokio/auth/login").unwrap() {
+            LinkPath::Scoped { project_id, tail } => {
+                assert_eq!(project_id, "tokio");
+                assert_eq!(tail, "auth/login");
+            }
+            LinkPath::Local(_) => panic!("expected scoped"),
+        }
+    }
+
+    #[test]
+    fn parse_link_path_rejects_bad_scoped() {
+        assert!(parse_link_path("@").is_err());
+        assert!(parse_link_path("@onlyid").is_err());
+        assert!(parse_link_path("@a/").is_err());
+    }
+
+    #[test]
+    fn validate_link_path_scoped_requires_registered_project() {
+        let id = "zzz_lime_test_unregistered_project_id_581924";
+        assert!(validate_link_path(&format!("@{id}/topic")).is_err());
+    }
+
+    #[test]
+    fn path_matches_scoped_query_prefix() {
+        assert!(path_matches_link_query(
+            "@tokio/auth/login",
+            "@tokio/auth"
+        ));
+        assert!(!path_matches_link_query("auth/login", "@tokio/auth"));
+    }
+
+    #[test]
+    fn split_scoped_query_parses_tail() {
+        let (a, b) = split_scoped_query("@tokio/auth/sub").unwrap();
+        assert_eq!(a, "tokio");
+        assert_eq!(b, "auth/sub");
     }
 }

@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
@@ -107,6 +108,49 @@ pub struct DeathEvidence {
     pub reasons: Vec<DeathReason>,
 }
 
+/// How an outgoing dependency edge was inferred (see `dep_edges`). `uses_before` remains the union of targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DepEdgeKind {
+    /// Same-file identifier mention in component body (after sanitization).
+    #[default]
+    SameFile,
+    /// Single global match for an imported token.
+    ImportResolved,
+    /// `::Name` style tail resolution with a single match.
+    Qualified,
+    /// Chosen among several same-name components via deterministic rules.
+    ImportDisambiguated,
+}
+
+impl DepEdgeKind {
+    /// Stronger kind wins when merging duplicate targets.
+    pub(crate) fn max_rank(self, other: Self) -> Self {
+        match self.rank().cmp(&other.rank()) {
+            Ordering::Greater => self,
+            Ordering::Less => other,
+            Ordering::Equal => self,
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            DepEdgeKind::SameFile => 4,
+            DepEdgeKind::ImportResolved => 3,
+            DepEdgeKind::Qualified => 3,
+            DepEdgeKind::ImportDisambiguated => 2,
+        }
+    }
+}
+
+/// Outgoing dependency with classification (parallel to `uses_before` targets).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepEdge {
+    pub target: String,
+    #[serde(default)]
+    pub kind: DepEdgeKind,
+}
+
 /// Component-level index record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentRecord {
@@ -129,6 +173,9 @@ pub struct ComponentRecord {
     pub uses_before: Vec<String>,
     /// IDs of components that reference this component.
     pub used_by_after: Vec<String>,
+    /// Classified outgoing edges (same targets as `uses_before`, with kinds).
+    #[serde(default)]
+    pub dep_edges: Vec<DepEdge>,
     /// Compatibility flag: true when `death_status != Alive`.
     #[serde(default)]
     pub batman: bool,
@@ -496,6 +543,7 @@ fn build_indexed_file(
             end_line: component.end_line,
             uses_before: Vec::new(),
             used_by_after: Vec::new(),
+            dep_edges: Vec::new(),
             batman: false,
             death_status: DeathStatus::Alive,
             death_evidence: DeathEvidence::default(),

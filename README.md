@@ -8,9 +8,9 @@
 
 - **Index** — full sync, optional git-partial sync on dirty paths (after the index has components), or per-file `add` / `remove`
 - **Discover** — `search` (substring or `--fuzzy`), `list` with `--dead` / `--fault` filters
-- **Inspect** — `show` (source + line refs + optional diagnostics), `deps` (uses / used-by)
+- **Inspect** — `show` (source + line refs + optional diagnostics), `deps` (uses / used-by graph; heuristic edges + optional `dep_edges` kinds in the index)
 - **Notes & navigation** — `annotate`, `links` (merged store + annotation paths), `sum` overview
-- **Multiple repos** — `registry` writes `~/.lime/projects.json`; **`--external <id>`** routes reads (and safe `annotate add`) to another registered root
+- **Multiple repos** — `registry` writes `~/.lime/projects.json`; **`--external <id>`** routes reads and scoped workflows (`links`, `annotate add`, …) to another registered root; **scoped link paths** `@registered_id/topic` tie components to other checkouts without a separate graph file (see [SKILL.md](SKILL.md))
 - **Settings** — project `.lime/lime.json` and optional **global** template via `lime config --global …`
 
 **Language aliases** (also for `list`, `annotate list`, …): `rs`→rust, `py`→python, `js`→javascript, `ts`→typescript.
@@ -58,9 +58,9 @@ Agents and scripts should pass **`--json`** on every invocation for stable, pars
 | `links` | `show` / `list` / `add` / `remove` / `compact` for topic paths |
 | `sum` | Bounded workspace summary (e.g. link hotspots) |
 | `registry` | `list` / `add` / `remove` registered project roots |
-| `config` | View or set options; add `--global` for user-wide defaults |
+| `config` | View or set options; **`lime config --global <subcmd>`** for the user-wide template (place `--global` immediately after `lime config`) |
 
-`--external <projectID>` is allowed only where it is safe (reads and `annotate add` to foreign trees); mutating index/link/registry commands stay on the current project.
+`--external <projectID>` is rejected for `sync`, per-file `add`/`remove`, `config`, and `registry`. It is allowed for read-only inspection and for **`links` add/remove/compact** and **`annotate add`** against the foreign repo’s `.lime/` (see `lime --help` and [SKILL.md](SKILL.md)).
 
 Run **`lime --help`** and **`lime <cmd> --help`** for flags and examples.
 

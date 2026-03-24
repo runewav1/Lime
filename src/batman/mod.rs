@@ -9,6 +9,36 @@ use crate::{
     index::{DeathEvidence, DeathReason, DeathStatus, IndexData},
 };
 
+/// Undirected adjacency for death-detection reachability — same edges as `deps::populate_dependencies` materializes into `uses_before` / `used_by_after`.
+pub(crate) fn build_component_adjacency(index: &IndexData) -> Vec<BTreeSet<usize>> {
+    let total = index.components.len();
+    let id_to_idx: HashMap<&str, usize> = index
+        .components
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.id.as_str(), i))
+        .collect();
+
+    let mut adjacency: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); total];
+
+    for (i, component) in index.components.iter().enumerate() {
+        for dep_id in &component.uses_before {
+            if let Some(&j) = id_to_idx.get(dep_id.as_str()) {
+                adjacency[i].insert(j);
+                adjacency[j].insert(i);
+            }
+        }
+        for dep_id in &component.used_by_after {
+            if let Some(&j) = id_to_idx.get(dep_id.as_str()) {
+                adjacency[i].insert(j);
+                adjacency[j].insert(i);
+            }
+        }
+    }
+
+    adjacency
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DeathReport {
     pub total_components: usize,
@@ -54,7 +84,9 @@ pub fn detect_batman_full(
         };
     }
 
-    // --- Build deterministic adjacency graph ---
+    // --- Build deterministic adjacency graph (mirrors `uses_before` / `used_by_after`) ---
+
+    let adjacency = build_component_adjacency(index);
 
     let id_to_idx: HashMap<&str, usize> = index
         .components
@@ -62,23 +94,6 @@ pub fn detect_batman_full(
         .enumerate()
         .map(|(i, c)| (c.id.as_str(), i))
         .collect();
-
-    let mut adjacency: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); total_components];
-
-    for (i, component) in index.components.iter().enumerate() {
-        for dep_id in &component.uses_before {
-            if let Some(&j) = id_to_idx.get(dep_id.as_str()) {
-                adjacency[i].insert(j);
-                adjacency[j].insert(i);
-            }
-        }
-        for dep_id in &component.used_by_after {
-            if let Some(&j) = id_to_idx.get(dep_id.as_str()) {
-                adjacency[i].insert(j);
-                adjacency[j].insert(i);
-            }
-        }
-    }
 
     // --- Pass 1: deterministic BFS island detection ---
 

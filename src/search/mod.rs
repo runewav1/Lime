@@ -514,6 +514,16 @@ pub fn build_token_index(
             if !ann_tokens.contains(&link_lower) {
                 ann_tokens.push(link_lower);
             }
+            for seg in link.split('/') {
+                let mut s = seg.trim();
+                if s.starts_with('@') {
+                    s = s.trim_start_matches('@');
+                }
+                let t = s.to_ascii_lowercase();
+                if t.len() >= 2 && !ann_tokens.contains(&t) {
+                    ann_tokens.push(t);
+                }
+            }
         }
 
         add_tokens(
@@ -539,7 +549,11 @@ pub fn build_token_index(
                 link_tokens.push(lower.clone());
             }
             for seg in path.split('/') {
-                let t = seg.trim().to_ascii_lowercase();
+                let mut s = seg.trim();
+                if s.starts_with('@') {
+                    s = s.trim_start_matches('@');
+                }
+                let t = s.to_ascii_lowercase();
                 if t.len() >= 2 && !link_tokens.contains(&t) {
                     link_tokens.push(t);
                 }
@@ -1186,6 +1200,7 @@ mod tests {
             end_line: 1,
             uses_before: Vec::new(),
             used_by_after: Vec::new(),
+            dep_edges: Vec::new(),
             batman: false,
             death_status: DeathStatus::Alive,
             death_evidence: DeathEvidence::default(),

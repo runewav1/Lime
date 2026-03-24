@@ -403,6 +403,7 @@ mod tests {
             end_line: 5,
             uses_before: vec![],
             used_by_after: vec![],
+            dep_edges: vec![],
             batman: false,
             death_status: DeathStatus::Alive,
             death_evidence: Default::default(),

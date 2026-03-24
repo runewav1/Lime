@@ -111,7 +111,7 @@ pub fn render(payload: &Value) -> String {
             } else {
                 render_links_cmd(payload, &s)
             }
-        },
+        }
         "sum" => render_sum(payload, &s),
         "list" => render_list(payload, &s),
         "deps" => render_deps(payload, &s),
@@ -583,17 +583,18 @@ fn render_links_cmd(v: &Value, s: &Style) -> String {
             let id = str_val(v, "component_id");
             let path = str_val(v, "path");
             let removed = v.get("removed").and_then(Value::as_bool).unwrap_or(false);
-            let status = if removed { s.bold_green("removed") } else { s.yellow("not found") };
-            let _ = writeln!(
-                out,
-                "{} {} → {}",
-                status,
-                s.dim(&id),
-                s.cyan(&path)
-            );
+            let status = if removed {
+                s.bold_green("removed")
+            } else {
+                s.yellow("not found")
+            };
+            let _ = writeln!(out, "{} {} → {}", status, s.dim(&id), s.cyan(&path));
         }
         "compact" => {
-            let n = v.get("annotations_updated").and_then(Value::as_u64).unwrap_or(0);
+            let n = v
+                .get("annotations_updated")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             let _ = writeln!(
                 out,
                 "{} {}",
@@ -643,12 +644,7 @@ fn render_sum(v: &Value, s: &Style) -> String {
         s.dim("components:"),
         num_val(v, "component_count")
     );
-    let _ = writeln!(
-        out,
-        "  {}  {}",
-        s.dim("files:"),
-        num_val(v, "file_count")
-    );
+    let _ = writeln!(out, "  {}  {}", s.dim("files:"), num_val(v, "file_count"));
     let _ = writeln!(
         out,
         "  {}  {}",
@@ -895,26 +891,24 @@ fn render_list_components(v: &Value, label: &str, s: &Style) -> String {
                     } else {
                         String::new()
                     };
-                    let fault_total = component
-                        .get("faults")
-                        .and_then(|f| {
-                            let e = f.get("errors").and_then(Value::as_u64).unwrap_or(0);
-                            let w = f.get("warnings").and_then(Value::as_u64).unwrap_or(0);
-                            let n = f.get("notes").and_then(Value::as_u64).unwrap_or(0);
-                            let t = e + w + n;
-                            if t > 0 { Some(t) } else { None }
-                        });
+                    let fault_total = component.get("faults").and_then(|f| {
+                        let e = f.get("errors").and_then(Value::as_u64).unwrap_or(0);
+                        let w = f.get("warnings").and_then(Value::as_u64).unwrap_or(0);
+                        let n = f.get("notes").and_then(Value::as_u64).unwrap_or(0);
+                        let t = e + w + n;
+                        if t > 0 {
+                            Some(t)
+                        } else {
+                            None
+                        }
+                    });
                     let fault_marker = fault_total
                         .map(|n| format!(" {}", s.bold_red(&format!("[{n} fault{}]", plural(n)))))
                         .unwrap_or_default();
 
                     let id_padded = pad_plain_right(&id, max_id_len);
                     let id_dim = s.dim(&id_padded);
-                    let line_part = format!(
-                        ":{:>lw$}",
-                        start,
-                        lw = LIST_LINE_NUMBER_COL_WIDTH
-                    );
+                    let line_part = format!(":{:>lw$}", start, lw = LIST_LINE_NUMBER_COL_WIDTH);
                     let _ = writeln!(
                         out,
                         "{}{}  {}  {}{}{}",
@@ -967,15 +961,17 @@ fn render_show(v: &Value, s: &Style) -> String {
         } else {
             String::new()
         };
-        let fault_total = component
-            .get("faults")
-            .and_then(|f| {
-                let e = f.get("errors").and_then(Value::as_u64).unwrap_or(0);
-                let w = f.get("warnings").and_then(Value::as_u64).unwrap_or(0);
-                let n = f.get("notes").and_then(Value::as_u64).unwrap_or(0);
-                let t = e + w + n;
-                if t > 0 { Some(t) } else { None }
-            });
+        let fault_total = component.get("faults").and_then(|f| {
+            let e = f.get("errors").and_then(Value::as_u64).unwrap_or(0);
+            let w = f.get("warnings").and_then(Value::as_u64).unwrap_or(0);
+            let n = f.get("notes").and_then(Value::as_u64).unwrap_or(0);
+            let t = e + w + n;
+            if t > 0 {
+                Some(t)
+            } else {
+                None
+            }
+        });
         let fault_marker = fault_total
             .map(|n| format!(" {}", s.bold_red(&format!("[{n} fault{}]", plural(n)))))
             .unwrap_or_default();
@@ -1457,16 +1453,41 @@ fn render_registry(v: &Value, s: &Style) -> String {
             );
             if let Some(items) = v.get("projects").and_then(Value::as_array) {
                 for item in items {
-                    let pid = item.get("project_id").and_then(Value::as_str).unwrap_or("?");
+                    let pid = item
+                        .get("project_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?");
                     let root = item.get("root").and_then(Value::as_str).unwrap_or("?");
-                    let _ = writeln!(out, "  {} {}", s.cyan(pid), s.dim(root));
+                    let langs: Vec<&str> = item
+                        .get("languages")
+                        .and_then(Value::as_array)
+                        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    if langs.is_empty() {
+                        let _ = writeln!(out, "  {} {}", s.cyan(pid), s.dim(root));
+                    } else {
+                        let lang_str = format!("[{}]", langs.join(", "));
+                        let _ = writeln!(
+                            out,
+                            "  {} {}  {}",
+                            s.cyan(pid),
+                            s.dim(root),
+                            s.dim(&lang_str)
+                        );
+                    }
                 }
             }
         }
         "add" => {
             let pid = str_val(v, "project_id");
             let root = str_val(v, "root");
-            let _ = writeln!(out, "{} {} -> {}", s.bold_green("registered"), s.cyan(&pid), root);
+            let _ = writeln!(
+                out,
+                "{} {} -> {}",
+                s.bold_green("registered"),
+                s.cyan(&pid),
+                root
+            );
         }
         "remove" => {
             let pid = str_val(v, "project_id");
@@ -1699,7 +1720,11 @@ fn list_marker_plain_len(c: &Value) -> usize {
         let w = f.get("warnings").and_then(Value::as_u64).unwrap_or(0);
         let note = f.get("notes").and_then(Value::as_u64).unwrap_or(0);
         let t = e + w + note;
-        if t > 0 { Some(t) } else { None }
+        if t > 0 {
+            Some(t)
+        } else {
+            None
+        }
     });
     if let Some(t) = fault_total {
         n += 2 + format!("[{t} fault{}]", plural(t)).len();
@@ -1733,7 +1758,10 @@ fn list_colon_column(term_w: usize, max_id_len: usize, max_marker: usize) -> usi
 /// Visible width available for the label (after indent, before `  :`).
 fn list_label_slot_width(indent_cols: usize, colon_col: usize) -> usize {
     // indent + label + "  " + ":" ... => label ends at colon_col - 2
-    colon_col.saturating_sub(indent_cols).saturating_sub(2).max(1)
+    colon_col
+        .saturating_sub(indent_cols)
+        .saturating_sub(2)
+        .max(1)
 }
 
 fn collapse_whitespace(raw: &str) -> String {

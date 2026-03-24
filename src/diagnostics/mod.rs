@@ -455,6 +455,7 @@ mod tests {
             end_line: end,
             uses_before: Vec::new(),
             used_by_after: Vec::new(),
+            dep_edges: Vec::new(),
             batman: false,
             death_status: DeathStatus::Alive,
             death_evidence: DeathEvidence::default(),

@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
 
@@ -13,12 +12,9 @@ use serde_json::{json, Value};
 use crate::{
     annotations,
     config::LimeConfig,
-    deps,
-    diagnostics,
-    git_staleness,
+    deps, diagnostics, git_staleness,
     index::{self, ComponentRecord, DeathStatus, FileUpdateResult, IndexData},
-    links,
-    projects_registry,
+    links, projects_registry,
     search::{self, MatchType},
     storage,
 };
@@ -81,16 +77,10 @@ pub fn run() -> Result<()> {
             handle_search(target.effective_root.clone(), terms, fuzzy)
                 .map(|p| attach_target(p, &target))
         }
-        Commands::Links { action } => match action {
-            LinksAction::Show { .. } | LinksAction::List { .. } => {
-                let target = resolve_command_target(&root, external.clone())?;
-                handle_links(target.effective_root.clone(), action).map(|p| attach_target(p, &target))
-            }
-            _ => {
-                ensure_external_disabled("links mutating actions", external.as_deref())?;
-                handle_links(root, action)
-            }
-        },
+        Commands::Links { action } => {
+            let target = resolve_command_target(&root, external.clone())?;
+            handle_links(target.effective_root.clone(), action).map(|p| attach_target(p, &target))
+        }
         Commands::Sum { top_links } => {
             let target = resolve_command_target(&root, external.clone())?;
             handle_sum(target.effective_root.clone(), top_links).map(|p| attach_target(p, &target))
@@ -115,7 +105,8 @@ pub fn run() -> Result<()> {
         }
         Commands::Show { component_id } => {
             let target = resolve_command_target(&root, external.clone())?;
-            handle_show(target.effective_root.clone(), component_id).map(|p| attach_target(p, &target))
+            handle_show(target.effective_root.clone(), component_id)
+                .map(|p| attach_target(p, &target))
         }
         Commands::Deps {
             component_id,
@@ -245,28 +236,40 @@ fn exit_error(message: &str, json_mode: bool) -> ! {
 #[command(
     name = "lime",
     version,
+    about = "Language-aware codebase index, search, deps, annotations, and links for agents.",
+    long_about = "Lime builds a component index under .lime/, supports git-partial sync when configured, and optional --json on every command for machine output. Use lime registry add + --external <id> to query another registered repo without copying its index.",
     after_long_help = r#"Examples:
-  lime sync                      Full index (default) or git partial if configured
-  lime sync --git                Partial sync on git dirty paths
+  lime sync                      Full or git-partial empty sync (see config); first run is full if index empty
+  lime sync --git                Partial sync on git dirty paths (no file args)
+  lime sync src/main.rs          Re-index only these files
   lime search run                Find components named "run"
   lime search rust fn run        Search Rust functions
-  lime list rust                 Show Rust component counts
-  lime list rust --all           List all Rust components
-  lime deps fn-61bcc6dabec3f308  Show dependency matrix
-  lime links show auth           Components matching link path auth (merged store + annotations)
-  lime links list                All link paths; lime links add <id> <path> to assign
-  lime registry add              Register current directory in ~/.lime router
-  lime registry add ../tokio     Register another repo root
-  lime show --external tokio fn-abc123
-  lime sum                       Bounded overview (counts, links, staleness)"#
+  lime list rust                 Show Rust component counts by type
+  lime list rust --all           List all Rust components with IDs
+  lime deps fn-61bcc6dabec3f308  Dependency matrix (depth from config or --depth)
+  lime links show auth           Components on link path auth (merged store + annotations)
+  lime links show @peer/topic    Scoped path (registered project + topic)
+  lime --external r links add …  Add/remove/compact links in that repo's .lime/
+  lime links list                All link paths
+  lime registry add              Register cwd in ~/.lime/projects.json
+  lime registry add --id tokio ../tokio   Register with explicit id
+  lime --external tokio show fn-abc123    Read from another registered root
+  lime sum                       Overview: counts, top links, staleness
+
+Global flags: --json (machine output), --external <id> (route index/IO to another registered root: show, search, list, deps, sum, links, annotate; links add/remove/compact write that repo's `.lime/`)."#
 )]
 struct Cli {
-    #[arg(long, global = true, help = "Output raw JSON for scripts and agents")]
+    #[arg(
+        long,
+        global = true,
+        help = "Print machine-readable JSON (stable for scripts and agents)"
+    )]
     json: bool,
     #[arg(
         long,
         global = true,
-        help = "Route supported read commands to a registered external project id"
+        value_name = "PROJECT_ID",
+        help = "Registered project id → use that repo root for commands that support it (see `lime --help`; includes links add/remove/compact and annotate add)"
     )]
     external: Option<String>,
 
@@ -278,8 +281,10 @@ struct Cli {
 enum Commands {
     /// Rebuild the index for the whole project or specific files.
     ///
-    /// Without arguments, rebuilds from scratch. With file paths,
-    /// only those files are re-indexed; the rest stays intact.
+    /// **With file paths:** partial re-index of only those files; `--git` / `--no-git` are ignored.
+    ///
+    /// **With no paths:** full rebuild, git-partial on dirty paths, or noop — see `lime config git-partial-sync`.
+    /// If git-partial is enabled, the first sync still does a **full** index when the index has no components yet.
     ///
     /// Examples:
     ///   "lime sync"                        full index, or git partial if configured (only after index exists)
@@ -287,31 +292,33 @@ enum Commands {
     ///   "lime sync --no-git"               full rebuild even if config uses git partial
     ///   "lime sync src/main.rs"            re-index a single file (git flags ignored)
     Sync {
-        /// Specific files to re-index. Omit: full rebuild or git partial per config/flags.
+        /// Files to re-index (project-relative or absolute). If empty, whole-project sync per config/flags.
+        #[arg(value_name = "FILE")]
         files: Vec<String>,
-        /// Run static analyzers and attach fault data to components.
+        /// Run static analyzers during sync and attach fault data to components (`diagnostics.*` in config).
         #[arg(long)]
         diagnostics: bool,
-        /// Show detailed output (component breakdown).
+        /// Verbose human output: per-file / component breakdown where supported.
         #[arg(short = 'v', long)]
         verbose: bool,
-        /// Empty sync: partial index on `git status` dirty paths (overrides config default).
+        /// Empty sync only: use `git status` dirty paths (overrides `git_partial_sync` default for this run).
         #[arg(long, conflicts_with = "no_git")]
         git: bool,
-        /// Empty sync: full rebuild (overrides `git_partial_sync.empty_sync_uses_git`).
+        /// Empty sync only: force full rebuild (overrides `git_partial_sync.empty_sync_uses_git`).
         #[arg(long, conflicts_with = "git")]
         no_git: bool,
     },
     /// Add a single file to the index.
     ///
     /// Parses the file and adds discovered components to the index.
-    /// If already indexed, its entries are refreshed.
+    /// If already indexed, its entries are refreshed. Run from the project root (or use paths relative to it).
     ///
     /// Examples:
     ///   "lime add src/auth.rs"
     ///   "lime add src/utils/mod.rs"
     Add {
         /// File path to index (relative to project root or absolute).
+        #[arg(value_name = "PATH")]
         filename: String,
     },
     /// Remove a file and all its components from the index.
@@ -321,7 +328,8 @@ enum Commands {
     /// Examples:
     ///   "lime remove src/old.rs"
     Remove {
-        /// File path to remove (relative to project root or absolute).
+        /// File path to drop from the index only; disk file is unchanged.
+        #[arg(value_name = "PATH")]
         filename: String,
     },
     /// Search indexed components by name, file, or ID.
@@ -339,28 +347,31 @@ enum Commands {
     ///   "lime search rust fn run"       filter by language and type
     ///   "lime search --fuzzy auth"      fuzzy match on tokens and annotations
     Search {
-        /// Query terms. Format: [language] [type] <query>
+        /// Terms: `[language] [type] <query>` — language aliases: rs, py, js, ts. Multi-word query after language/type.
+        #[arg(value_name = "TERMS")]
         terms: Vec<String>,
-        /// Enable fuzzy matching with token-based and annotation search.
+        /// Fuzzy match on tokens, stems, and annotation text (slower, broader).
         #[arg(long)]
         fuzzy: bool,
     },
     /// Link paths: query members, list paths, or edit `.lime/component_links.json`.
     ///
     /// All link operations use one subcommand group:
-    /// - **show** — components whose merged paths match a path or prefix (`auth` matches `auth/login`).
+    /// - **show** — components whose merged paths match a path or prefix (`auth` matches `auth/login`). Scoped: `@<registered_id>/<topic>`; optional **`--peer-resolve`** loads the peer index and matches local paths to the topic tail.
     /// - **list** — distinct paths (`--tree` indents by `/` depth).
-    /// - **add** / **remove** — membership without editing annotation prose.
+    /// - **add** / **remove** — membership without editing annotation prose (local or scoped paths; scoped ids must be in `lime registry list`).
     /// - **compact** — drop duplicate `links` lines from annotations when the store already has the path.
     ///
     /// Membership is merged from `.lime/component_links.json` and annotation frontmatter `links`.
     ///
     /// Examples:
     ///   "lime links show auth"
+    ///   "lime links show @myapp/topic --peer-resolve"
     ///   "lime links show auth/login --notes"
     ///   "lime links list"
     ///   "lime links list auth --tree"
     ///   "lime links add fn-abc123 auth/login"
+    ///   "lime --external other links add fn-x @app/feature"
     ///   "lime links remove fn-abc123 auth/login"
     ///   "lime links compact"
     Links {
@@ -373,8 +384,8 @@ enum Commands {
     ///   "lime sum"
     ///   "lime sum --top-links 16"
     Sum {
-        /// Max number of link labels to include in `links_top` (by frequency).
-        #[arg(long, default_value_t = 32)]
+        /// How many of the most frequent link paths to include in `links_top` (1–256 clamped in handler).
+        #[arg(long, default_value_t = 32, value_name = "N")]
         top_links: usize,
     },
     /// List indexed languages or components.
@@ -390,19 +401,22 @@ enum Commands {
     ///   "lime list rust fn"      list only functions
     ///   "lime list python class" list only classes
     ///   "lime list ts --all"     typescript components (alias)
+    ///
+    /// `--dead` / `--fault` without `--all` still lists all matching components for the language (full list mode).
     List {
-        /// Language to inspect (`rs`/`py`/`js`/`ts` → rust/python/javascript/typescript).
+        /// Language (`rs`/`py`/`js`/`ts` → rust/python/javascript/typescript). Omit: list indexed languages only.
+        #[arg(value_name = "LANG")]
         language: Option<String>,
-        /// Component type to filter by (e.g. `fn`, `struct`, `class`).
-        #[arg(allow_hyphen_values = true)]
+        /// Component type (e.g. `fn`, `struct`, `async def`). Incompatible with `--all`.
+        #[arg(allow_hyphen_values = true, value_name = "TYPE")]
         component_type: Option<String>,
-        /// List all components for the given language (no type grouping).
+        /// List every component with IDs for the language (no per-type summary).
         #[arg(short = 'a', long = "all")]
         all: bool,
-        /// Only include components marked as dead.
+        /// Restrict to dead-code tier (combine with `--fault` for union).
         #[arg(long)]
         dead: bool,
-        /// Only include components with analyzer faults.
+        /// Restrict to components with diagnostic faults (combine with `--dead` for union).
         #[arg(long)]
         fault: bool,
     },
@@ -416,17 +430,21 @@ enum Commands {
     ///   "lime deps fn-abc123def456"           default depth
     ///   "lime deps fn-abc123def456 --depth 3" traverse 3 levels
     ///   "lime deps fn-abc123def456 --depth 0" component only
+    ///
+    /// Traversal depth limits the **display** graph only; death detection uses the full stored edge set.
     Deps {
-        /// Component ID to inspect (from `lime search` or `lime list`).
+        /// Component ID (`type-hexhash` from `lime list --all` or `lime search`).
+        #[arg(value_name = "COMPONENT_ID")]
         component_id: String,
-        /// Maximum traversal depth (default: value from .lime/lime.json, usually 2).
-        #[arg(long)]
+        /// Max hops in each direction (uses / used-by). Default: `default_dependency_depth` in config. `0` = no neighbors in matrix.
+        #[arg(long, value_name = "N")]
         depth: Option<usize>,
     },
     /// Manage component annotations.
     ///
     /// Attach semantic notes to indexed components. Annotations persist
     /// alongside the index and can be searched with `lime search --fuzzy`.
+    /// With `--external`, `add`/`show`/`list` target the foreign index; valid `-l` paths also update that repo’s link store; `remove` is not allowed (see error text).
     ///
     /// Examples:
     ///   "lime annotate add fn-abc123 -m 'Entry point for auth'"
@@ -446,17 +464,18 @@ enum Commands {
     ///
     /// Examples:
     ///   "lime show fn-abc123def456"
+    ///   "lime --external tokio show fn-abc123"
     Show {
-        /// Component ID (from `lime search` or `lime list --all`).
+        /// Component ID (`type-hexhash`).
+        #[arg(value_name = "COMPONENT_ID")]
         component_id: String,
     },
 
     /// Inspect and update Lime configuration.
     ///
     /// By default this reads/writes the **project** config (`.lime/lime.json`).
-    /// Pass `--global` to operate on the **global** config instead
-    /// (`~/.config/lime/lime.json` on Linux/macOS, `%APPDATA%\lime\lime.json`
-    /// on Windows).
+    /// Pass **`--global` before the subcommand** to operate on the **global** template
+    /// (`~/.config/lime/lime.json` on Linux/macOS, `%APPDATA%\lime\lime.json` on Windows).
     ///
     /// The global config is used as a template when initialising new project
     /// configs, so preferences set globally carry over automatically.
@@ -473,7 +492,7 @@ enum Commands {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
-        /// Operate on the global config (~/.config/lime/lime.json) instead of the project config.
+        /// Apply to the user-wide template file instead of `.lime/lime.json` (place `--global` right after `lime config`).
         #[arg(long, global = true)]
         global: bool,
     },
@@ -500,15 +519,17 @@ enum RegistryAction {
     List,
     /// Register a repository root (defaults to current directory if path omitted).
     Add {
-        /// Optional explicit project id. Defaults to folder basename.
-        #[arg(long)]
+        /// Project id for `--external <id>` (default: basename of registered path).
+        #[arg(long, value_name = "ID")]
         id: Option<String>,
-        /// Repository root to register (omit = current working directory).
+        /// Root directory to register (default: current working directory).
+        #[arg(value_name = "ROOT")]
         path: Option<PathBuf>,
     },
     /// Remove a registered project id from the router file.
     Remove {
-        /// Project id to remove.
+        /// Id as shown in `lime registry list`.
+        #[arg(value_name = "PROJECT_ID")]
         project_id: String,
     },
 }
@@ -523,33 +544,42 @@ enum LinksAction {
     ///   "lime links show auth"
     ///   "lime links show auth/oauth --notes"
     Show {
-        /// Link path or prefix (e.g. `auth`, `auth/login`).
+        /// Path or prefix (`auth` matches `auth` and `auth/login`). Scoped: `@<registered_id>/<topic>`.
+        #[arg(value_name = "PATH_OR_PREFIX")]
         path: String,
-        /// Include full annotation markdown in each result.
+        /// Include full annotation body per hit (JSON/human).
         #[arg(long)]
         notes: bool,
+        /// With a scoped query `@peer/topic`, also load that peer repo and include components whose **local** paths match `topic` (extra index load).
+        #[arg(long = "peer-resolve")]
+        peer_resolve: bool,
     },
     /// List distinct link paths across the project (merged store + annotations).
     List {
-        /// Only paths equal to or under this prefix (case-insensitive).
+        /// Restrict to paths under this prefix (case-insensitive). Omit: all paths.
+        #[arg(value_name = "PREFIX")]
         prefix: Option<String>,
-        /// Indent paths by `/` depth for terminal output.
+        /// Tree-style indentation by `/` depth (human output).
         #[arg(long)]
         tree: bool,
     },
     /// Add a link path for a component (writes `.lime/component_links.json`).
     Add {
-        /// Component ID (from `lime search` or `lime list --all`).
+        /// Component ID.
+        #[arg(value_name = "COMPONENT_ID")]
         component_id: String,
-        /// Link path using `/` segments (e.g. `auth/login`).
+        /// Hierarchical path (`/` segments, e.g. `auth/login`).
+        #[arg(value_name = "PATH")]
         path: String,
     },
     /// Remove a link path from the link store for a component.
     Remove {
+        #[arg(value_name = "COMPONENT_ID")]
         component_id: String,
+        #[arg(value_name = "PATH")]
         path: String,
     },
-    /// Drop duplicate `links` from annotation files when the path exists in the link store.
+    /// Remove redundant `links:` lines from annotation front matter when the link store already has the path.
     Compact,
 }
 
@@ -566,7 +596,8 @@ enum AnnotateAction {
     ///   "lime annotate add fn-x --file docs/fn-x.md --link auth/login"
     ///   "lime annotate add fn-x --link auth"   (updates links only if annotation exists; dual-writes link store)
     Add {
-        /// Component ID (from `lime search` or `lime list --all`).
+        /// Component ID to annotate.
+        #[arg(value_name = "COMPONENT_ID")]
         component_id: String,
         /// Inline markdown body (cannot be used with `--file`).
         #[arg(short = 'm', long = "message", conflicts_with = "body_file")]
@@ -588,7 +619,7 @@ enum AnnotateAction {
     /// Examples:
     ///   "lime annotate show fn-abc123"
     Show {
-        /// Component ID.
+        #[arg(value_name = "COMPONENT_ID")]
         component_id: String,
     },
     /// List annotated components.
@@ -602,9 +633,11 @@ enum AnnotateAction {
     ///   "lime annotate list ts fn"        typescript (alias) + type
     ///   "lime annotate list rust fn"      filter by language and type
     List {
-        /// Filter by language (`rs`/`py`/`js`/`ts` aliases supported).
+        /// Filter by language (aliases: rs, py, js, ts).
+        #[arg(value_name = "LANG")]
         language: Option<String>,
-        /// Filter by component type (e.g. `fn`, `struct`).
+        /// Filter by component type (e.g. `fn`, `async def`).
+        #[arg(allow_hyphen_values = true, value_name = "TYPE")]
         component_type: Option<String>,
     },
     /// Remove an annotation from a component.
@@ -614,7 +647,7 @@ enum AnnotateAction {
     /// Examples:
     ///   "lime annotate remove fn-abc123"
     Remove {
-        /// Component ID.
+        #[arg(value_name = "COMPONENT_ID")]
         component_id: String,
     },
 }
@@ -692,10 +725,7 @@ enum ConfigAction {
     ///   "lime config git-partial-sync --git-empty-sync true"
     GitPartialSync {
         /// Use `git status` dirty paths for empty `lime sync` (omit to only show current value).
-        #[arg(
-            long = "use-git-for-empty-sync",
-            visible_alias = "git-empty-sync"
-        )]
+        #[arg(long = "use-git-for-empty-sync", visible_alias = "git-empty-sync")]
         use_git_for_empty_sync: Option<bool>,
     },
 
@@ -705,8 +735,8 @@ enum ConfigAction {
     ///   "lime config dependency-depth"           show current value
     ///   "lime config dependency-depth --depth 4" set value
     DependencyDepth {
-        /// New default dependency depth (≥ 0).
-        #[arg(long)]
+        /// Default hops for `lime deps` when `--depth` is omitted (≥ 0).
+        #[arg(long, value_name = "N")]
         depth: Option<usize>,
     },
 
@@ -734,8 +764,8 @@ enum ConfigAction {
     ///   "lime config index-storage"                    show current path
     ///   "lime config index-storage --path .lime/index.json"
     IndexStorage {
-        /// Relative or absolute path for the index file.
-        #[arg(long)]
+        /// Relative or absolute path for `index.json` (stored as `index_storage` in config).
+        #[arg(long, value_name = "PATH")]
         path: Option<String>,
     },
 }
@@ -749,10 +779,16 @@ fn handle_registry(cwd: PathBuf, action: RegistryAction) -> Result<Value> {
                 .projects
                 .iter()
                 .map(|(project_id, reg)| {
+                    let project_root = PathBuf::from(&reg.root);
+                    let languages: Vec<String> = LimeConfig::load_or_create(&project_root)
+                        .and_then(|config| storage::load_index_or_empty(&project_root, &config))
+                        .map(|index| index.languages)
+                        .unwrap_or_default();
                     json!({
                         "project_id": project_id,
                         "root": reg.root,
                         "updated_at": reg.updated_at,
+                        "languages": languages,
                     })
                 })
                 .collect();
@@ -1115,7 +1151,11 @@ fn handle_sync(
     Ok(response)
 }
 
-fn run_and_attach_diagnostics(root: &std::path::Path, index: &mut IndexData, enabled: bool) -> Value {
+fn run_and_attach_diagnostics(
+    root: &std::path::Path,
+    index: &mut IndexData,
+    enabled: bool,
+) -> Value {
     if !enabled {
         let _ = storage::save_diagnostics_cache(root, &std::collections::HashMap::new());
         return json!({ "enabled": false, "status": "skipped" });
@@ -1123,7 +1163,8 @@ fn run_and_attach_diagnostics(root: &std::path::Path, index: &mut IndexData, ena
 
     let results = diagnostics::run_diagnostics(root, index);
     let faults_map = diagnostics::map_diagnostics_to_components(root, &results, &index.components);
-    let entries_map = diagnostics::build_component_diagnostics_map(root, &results, &index.components);
+    let entries_map =
+        diagnostics::build_component_diagnostics_map(root, &results, &index.components);
 
     for component in &mut index.components {
         if let Some(faults) = faults_map.get(&component.id) {
@@ -1133,19 +1174,30 @@ fn run_and_attach_diagnostics(root: &std::path::Path, index: &mut IndexData, ena
 
     let _ = storage::save_diagnostics_cache(root, &entries_map);
 
-    let total_errors: usize = results.iter().flat_map(|r| &r.entries)
-        .filter(|e| e.severity == diagnostics::DiagSeverity::Error).count();
-    let total_warnings: usize = results.iter().flat_map(|r| &r.entries)
-        .filter(|e| e.severity == diagnostics::DiagSeverity::Warning).count();
+    let total_errors: usize = results
+        .iter()
+        .flat_map(|r| &r.entries)
+        .filter(|e| e.severity == diagnostics::DiagSeverity::Error)
+        .count();
+    let total_warnings: usize = results
+        .iter()
+        .flat_map(|r| &r.entries)
+        .filter(|e| e.severity == diagnostics::DiagSeverity::Warning)
+        .count();
     let faulty = faults_map.len();
 
-    let analyzer_info: Vec<Value> = results.iter().map(|r| json!({
-        "language": r.language,
-        "tool": r.tool,
-        "tool_found": r.tool_found,
-        "tool_failed": r.tool_failed,
-        "entry_count": r.entries.len(),
-    })).collect();
+    let analyzer_info: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            json!({
+                "language": r.language,
+                "tool": r.tool,
+                "tool_found": r.tool_found,
+                "tool_failed": r.tool_failed,
+                "entry_count": r.entries.len(),
+            })
+        })
+        .collect();
 
     json!({
         "enabled": true,
@@ -1612,9 +1664,8 @@ fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value
 
     let all_annotations = annotations::list_annotations(&root).unwrap_or_default();
     let link_map = links::merged_link_paths_by_component(&root, &index, &all_annotations);
-    let token_index = storage::load_token_index(&root)?.unwrap_or_else(|| {
-        search::build_token_index(&index, &all_annotations, &link_map)
-    });
+    let token_index = storage::load_token_index(&root)?
+        .unwrap_or_else(|| search::build_token_index(&index, &all_annotations, &link_map));
     let fuzzy_hits = if fuzzy {
         search::fuzzy_search(&token_index, &query.query)
     } else {
@@ -1750,6 +1801,12 @@ fn handle_search(root: PathBuf, terms: Vec<String>, fuzzy: bool) -> Result<Value
     }))
 }
 
+fn canonical_link_path_for_match(raw: &str) -> Option<String> {
+    links::validate_link_path(raw)
+        .ok()
+        .or_else(|| links::normalize_link_path_for_merge(raw))
+}
+
 fn annotation_links_match_query(annotation: &annotations::Annotation, query: &str) -> bool {
     let q = query.trim();
     if q.is_empty() {
@@ -1760,10 +1817,9 @@ fn annotation_links_match_query(annotation: &annotations::Annotation, query: &st
         if t.is_empty() {
             return false;
         }
-        match links::validate_link_path(t) {
-            Ok(p) => links::path_matches_link_query(&p, q),
-            Err(_) => t.eq_ignore_ascii_case(q),
-        }
+        canonical_link_path_for_match(t)
+            .map(|p| links::path_matches_link_query(&p, q))
+            .unwrap_or_else(|| t.eq_ignore_ascii_case(q))
     })
 }
 
@@ -1771,15 +1827,24 @@ fn link_path_display_depth(path: &str) -> usize {
     path.matches('/').count()
 }
 
+#[derive(Debug, Clone)]
+struct LinkResultMeta {
+    match_source: &'static str,
+    peer_project_id: Option<String>,
+    peer_repo_root: Option<String>,
+    matched_local_paths: Option<Vec<String>>,
+}
+
 fn json_for_link_result(
     comp: &ComponentRecord,
     merged_paths: &[String],
     ann: Option<&annotations::Annotation>,
     notes: bool,
+    meta: Option<&LinkResultMeta>,
 ) -> Value {
     let tags = ann.map(|a| a.tags.clone()).unwrap_or_default();
     let links_json: Vec<&str> = merged_paths.iter().map(String::as_str).collect();
-    if notes {
+    let mut base = if notes {
         if let Some(a) = ann {
             json!({
                 "component": comp,
@@ -1812,12 +1877,31 @@ fn json_for_link_result(
             "tags": tags,
             "annotation_preview": preview,
         })
+    };
+    if let Some(m) = meta {
+        if let Value::Object(ref mut map) = base {
+            map.insert("match_source".into(), json!(m.match_source));
+            if let Some(ref pid) = m.peer_project_id {
+                map.insert("peer_project_id".into(), json!(pid));
+            }
+            if let Some(ref pr) = m.peer_repo_root {
+                map.insert("peer_repo_root".into(), json!(pr));
+            }
+            if let Some(ref mp) = m.matched_local_paths {
+                map.insert("matched_local_paths".into(), json!(mp));
+            }
+        }
     }
+    base
 }
 
 fn handle_links(root: PathBuf, action: LinksAction) -> Result<Value> {
     match action {
-        LinksAction::Show { path, notes } => handle_link(root, path, notes),
+        LinksAction::Show {
+            path,
+            notes,
+            peer_resolve,
+        } => handle_link(root, path, notes, peer_resolve),
         LinksAction::Add { component_id, path } => {
             let config = LimeConfig::load_or_create(&root)?;
             let timer = std::time::Instant::now();
@@ -1865,12 +1949,8 @@ fn handle_links(root: PathBuf, action: LinksAction) -> Result<Value> {
             let timer = std::time::Instant::now();
             let index = storage::load_index_or_empty(&root, &config)?;
             let all_annotations = annotations::list_annotations(&root).unwrap_or_default();
-            let paths = links::distinct_merged_paths(
-                &root,
-                &index,
-                &all_annotations,
-                prefix.as_deref(),
-            );
+            let paths =
+                links::distinct_merged_paths(&root, &index, &all_annotations, prefix.as_deref());
             let mut out = json!({
                 "ok": true,
                 "command": "links",
@@ -1905,7 +1985,7 @@ fn handle_links(root: PathBuf, action: LinksAction) -> Result<Value> {
     }
 }
 
-fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
+fn handle_link(root: PathBuf, label: String, notes: bool, peer_resolve: bool) -> Result<Value> {
     let config = LimeConfig::load_or_create(&root)?;
     let timer = std::time::Instant::now();
     let index = storage::load_index_or_empty(&root, &config)?;
@@ -1915,6 +1995,10 @@ fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
     let q = label.trim();
     if q.is_empty() {
         bail!("link path query must not be empty");
+    }
+
+    if peer_resolve && !links::link_query_is_scoped(q) {
+        bail!("--peer-resolve requires a scoped query like @myapp/auth/login (registered project id + topic)");
     }
 
     let all_annotations = annotations::list_annotations(&root)?;
@@ -1933,6 +2017,17 @@ fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
             ann_by_id.insert(comp.id.as_str(), ann);
         }
     }
+
+    let scoped_meta = if peer_resolve {
+        Some(LinkResultMeta {
+            match_source: "scoped",
+            peer_project_id: None,
+            peer_repo_root: None,
+            matched_local_paths: None,
+        })
+    } else {
+        None
+    };
 
     let mut path_buckets: HashMap<String, HashSet<String>> = HashMap::new();
     for (cid, paths) in &merged {
@@ -1980,25 +2075,169 @@ fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
             .iter()
             .map(|comp| {
                 let mpaths = merged.get(comp.id.as_str()).cloned().unwrap_or_default();
-                json_for_link_result(comp, &mpaths, ann_by_id.get(comp.id.as_str()).copied(), notes)
+                json_for_link_result(
+                    comp,
+                    &mpaths,
+                    ann_by_id.get(comp.id.as_str()).copied(),
+                    notes,
+                    scoped_meta.as_ref(),
+                )
             })
             .collect();
 
-        path_groups.push(json!({
+        let mut pg = json!({
             "path": path,
             "depth": link_path_display_depth(path),
             "components": group_components,
-        }));
+        });
+        if peer_resolve {
+            if let Value::Object(ref mut m) = pg {
+                m.insert("match_source".into(), json!("scoped"));
+            }
+        }
+        path_groups.push(pg);
 
         for comp in comps {
-            if seen_result_ids.insert(comp.id.clone()) {
+            if seen_result_ids.insert(format!("scoped:{}", comp.id)) {
                 let mpaths = merged.get(comp.id.as_str()).cloned().unwrap_or_default();
                 results.push(json_for_link_result(
                     comp,
                     &mpaths,
                     ann_by_id.get(comp.id.as_str()).copied(),
                     notes,
+                    scoped_meta.as_ref(),
                 ));
+            }
+        }
+    }
+
+    if peer_resolve {
+        if let Some((peer_id, tail)) = links::split_scoped_query(q) {
+            let peer_root = projects_registry::resolve_project_root(&peer_id)?;
+            let peer_root_str = peer_root.display().to_string();
+            let peer_matches = links::peer_local_link_matches(&peer_root, &tail)?;
+            let peer_config = LimeConfig::load_or_create(&peer_root)?;
+            let peer_index = storage::load_index_or_empty(&peer_root, &peer_config)?;
+            let peer_annotations = annotations::list_annotations(&peer_root).unwrap_or_default();
+            let peer_merged =
+                links::merged_link_paths_by_component(&peer_root, &peer_index, &peer_annotations);
+
+            let mut peer_ann_by_id: HashMap<&str, &annotations::Annotation> = HashMap::new();
+            for ann in &peer_annotations {
+                if let Some(comp) = annotations::resolve_component_for_annotation(&peer_index, ann)
+                {
+                    peer_ann_by_id.insert(comp.id.as_str(), ann);
+                }
+            }
+
+            let mut matched_by_id: HashMap<String, Vec<String>> = HashMap::new();
+            for (comp, paths) in &peer_matches {
+                matched_by_id.insert(comp.id.clone(), paths.clone());
+            }
+
+            let mut peer_buckets: HashMap<String, HashSet<String>> = HashMap::new();
+            for (comp, matched_paths) in &peer_matches {
+                for mp in matched_paths {
+                    peer_buckets
+                        .entry(mp.clone())
+                        .or_default()
+                        .insert(comp.id.clone());
+                }
+            }
+
+            let mut peer_sorted_paths: Vec<String> = peer_buckets.keys().cloned().collect();
+            peer_sorted_paths.sort_by_key(|a| a.to_ascii_lowercase());
+
+            let peer_component_by_id: HashMap<&str, &ComponentRecord> = peer_index
+                .components
+                .iter()
+                .map(|c| (c.id.as_str(), c))
+                .collect();
+
+            for path in &peer_sorted_paths {
+                let Some(cids) = peer_buckets.get(path) else {
+                    continue;
+                };
+                let mut comps: Vec<&ComponentRecord> = cids
+                    .iter()
+                    .filter_map(|id| peer_component_by_id.get(id.as_str()).copied())
+                    .collect();
+                comps.sort_by(|a, b| {
+                    (
+                        a.file.as_str(),
+                        a.start_line,
+                        a.name.as_str(),
+                        a.id.as_str(),
+                    )
+                        .cmp(&(
+                            b.file.as_str(),
+                            b.start_line,
+                            b.name.as_str(),
+                            b.id.as_str(),
+                        ))
+                });
+
+                let group_components: Vec<Value> = comps
+                    .iter()
+                    .map(|comp| {
+                        let mpaths = peer_merged
+                            .get(comp.id.as_str())
+                            .cloned()
+                            .unwrap_or_default();
+                        let matched_local = matched_by_id
+                            .get(comp.id.as_str())
+                            .cloned()
+                            .unwrap_or_default();
+                        let meta = LinkResultMeta {
+                            match_source: "peer_local",
+                            peer_project_id: Some(peer_id.clone()),
+                            peer_repo_root: Some(peer_root_str.clone()),
+                            matched_local_paths: Some(matched_local),
+                        };
+                        json_for_link_result(
+                            comp,
+                            &mpaths,
+                            peer_ann_by_id.get(comp.id.as_str()).copied(),
+                            notes,
+                            Some(&meta),
+                        )
+                    })
+                    .collect();
+
+                path_groups.push(json!({
+                    "path": path,
+                    "depth": link_path_display_depth(path),
+                    "match_source": "peer_local",
+                    "peer_project_id": peer_id,
+                    "peer_repo_root": peer_root_str,
+                    "components": group_components,
+                }));
+
+                for comp in comps {
+                    if seen_result_ids.insert(format!("peer_local:{}", comp.id)) {
+                        let mpaths = peer_merged
+                            .get(comp.id.as_str())
+                            .cloned()
+                            .unwrap_or_default();
+                        let matched_local = matched_by_id
+                            .get(comp.id.as_str())
+                            .cloned()
+                            .unwrap_or_default();
+                        let meta = LinkResultMeta {
+                            match_source: "peer_local",
+                            peer_project_id: Some(peer_id.clone()),
+                            peer_repo_root: Some(peer_root_str.clone()),
+                            matched_local_paths: Some(matched_local),
+                        };
+                        results.push(json_for_link_result(
+                            comp,
+                            &mpaths,
+                            peer_ann_by_id.get(comp.id.as_str()).copied(),
+                            notes,
+                            Some(&meta),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -2031,10 +2270,7 @@ fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
         if component_by_id.contains_key(cid.as_str()) {
             continue;
         }
-        if !paths
-            .iter()
-            .any(|p| links::path_matches_link_query(p, q))
-        {
+        if !paths.iter().any(|p| links::path_matches_link_query(p, q)) {
             continue;
         }
         orphan_memberships.push(json!({
@@ -2073,6 +2309,7 @@ fn handle_link(root: PathBuf, label: String, notes: bool) -> Result<Value> {
         "action": "show",
         "link": q,
         "notes": notes,
+        "peer_resolve": peer_resolve,
         "result_count": results.len(),
         "results": results,
         "path_groups": path_groups,
@@ -2213,10 +2450,7 @@ fn handle_list(
         .iter()
         .filter(|c| c.death_status.is_dead())
         .count();
-    let faulty_count = components
-        .iter()
-        .filter(|c| c.faults.total() > 0)
-        .count();
+    let faulty_count = components.iter().filter(|c| c.faults.total() > 0).count();
 
     let mut by_type = BTreeMap::<String, usize>::new();
     for component in &components {
@@ -2260,7 +2494,9 @@ fn handle_show(root: PathBuf, component_id: String) -> Result<Value> {
         hasher.update(source.as_bytes());
         hasher.finalize().to_hex().to_string()
     };
-    let stored_hash = index.files.iter()
+    let stored_hash = index
+        .files
+        .iter()
         .find(|f| f.path == component.file)
         .map(|f| f.file_hash.clone())
         .unwrap_or_default();
@@ -2279,17 +2515,20 @@ fn handle_show(root: PathBuf, component_id: String) -> Result<Value> {
     let mut source_line_data: Vec<Value> = Vec::new();
     for (i, line_text) in component_lines.iter().enumerate() {
         let line_num = component.start_line + i;
-        let line_diags: Vec<Value> = diag_entries.iter()
+        let line_diags: Vec<Value> = diag_entries
+            .iter()
             .filter(|e| e.line == line_num)
-            .map(|e| json!({
-                "severity": match e.severity {
-                    diagnostics::DiagSeverity::Error => "error",
-                    diagnostics::DiagSeverity::Warning => "warning",
-                    diagnostics::DiagSeverity::Note => "note",
-                },
-                "code": e.code,
-                "message": e.message,
-            }))
+            .map(|e| {
+                json!({
+                    "severity": match e.severity {
+                        diagnostics::DiagSeverity::Error => "error",
+                        diagnostics::DiagSeverity::Warning => "warning",
+                        diagnostics::DiagSeverity::Note => "note",
+                    },
+                    "code": e.code,
+                    "message": e.message,
+                })
+            })
             .collect();
 
         source_line_data.push(json!({
@@ -2370,8 +2609,7 @@ fn handle_annotate(target: CommandTarget, action: AnnotateAction) -> Result<Valu
                 .ok_or_else(|| anyhow!("component not found: {component_id}"))?;
 
             let now = chrono::Utc::now().to_rfc3339();
-            let existing =
-                annotations::find_annotation_for_component(&root, &index, component)?;
+            let existing = annotations::find_annotation_for_component(&root, &index, component)?;
             let created_at = existing
                 .as_ref()
                 .map(|a| a.created_at.clone())
@@ -2392,6 +2630,11 @@ fn handle_annotate(target: CommandTarget, action: AnnotateAction) -> Result<Valu
             } else {
                 links
             };
+
+            for l in &merged_links {
+                crate::links::validate_link_path(l)
+                    .with_context(|| format!("invalid link path in annotation: {l}"))?;
+            }
 
             let body_path = body_file.as_ref().map(|p| {
                 if p.is_absolute() {
@@ -2433,32 +2676,33 @@ fn handle_annotate(target: CommandTarget, action: AnnotateAction) -> Result<Valu
             };
 
             annotations::save_annotation(&root, &annotation)?;
-            if !target.is_foreign() {
-                for link in &annotation.links {
-                    if links::validate_link_path(link).is_ok() {
-                        let _ = links::add_membership(&root, &component_id, link);
-                    }
+            for link in &annotation.links {
+                if crate::links::validate_link_path(link).is_ok() {
+                    let _ = crate::links::add_membership(&root, &component_id, link);
                 }
-                persist_token_index(&root, &index);
             }
+            persist_token_index(&root, &index);
             let elapsed = timer.elapsed();
 
-            Ok(attach_target(json!({
-                "ok": true,
-                "command": "annotate",
-                "action": "add",
-                "elapsed_secs": elapsed.as_secs_f64(),
-                "component": component,
-                "annotation": {
-                    "hash_id": annotation.hash_id,
-                    "content": annotation.content,
-                    "tags": annotation.tags,
-                    "links": annotation.links,
-                    "created_at": annotation.created_at,
-                    "updated_at": annotation.updated_at
-                },
-                "external_write_policy": if target.is_foreign() { "annotation_only" } else { "local_full" }
-            }), &target))
+            Ok(attach_target(
+                json!({
+                    "ok": true,
+                    "command": "annotate",
+                    "action": "add",
+                    "elapsed_secs": elapsed.as_secs_f64(),
+                    "component": component,
+                    "annotation": {
+                        "hash_id": annotation.hash_id,
+                        "content": annotation.content,
+                        "tags": annotation.tags,
+                        "links": annotation.links,
+                        "created_at": annotation.created_at,
+                        "updated_at": annotation.updated_at
+                    },
+                    "external_write_policy": if target.is_foreign() { "annotation_and_links" } else { "local_full" }
+                }),
+                &target,
+            ))
         }
         AnnotateAction::Show { component_id } => {
             let component = index
@@ -2471,21 +2715,24 @@ fn handle_annotate(target: CommandTarget, action: AnnotateAction) -> Result<Valu
                 .ok_or_else(|| anyhow!("no annotation for component: {component_id}"))?;
             let elapsed = timer.elapsed();
 
-            Ok(attach_target(json!({
-                "ok": true,
-                "command": "annotate",
-                "action": "show",
-                "elapsed_secs": elapsed.as_secs_f64(),
-                "component": component,
-                "annotation": {
-                    "hash_id": annotation.hash_id,
-                    "content": annotation.content,
-                    "tags": annotation.tags,
-                    "links": annotation.links,
-                    "created_at": annotation.created_at,
-                    "updated_at": annotation.updated_at
-                }
-            }), &target))
+            Ok(attach_target(
+                json!({
+                    "ok": true,
+                    "command": "annotate",
+                    "action": "show",
+                    "elapsed_secs": elapsed.as_secs_f64(),
+                    "component": component,
+                    "annotation": {
+                        "hash_id": annotation.hash_id,
+                        "content": annotation.content,
+                        "tags": annotation.tags,
+                        "links": annotation.links,
+                        "created_at": annotation.created_at,
+                        "updated_at": annotation.updated_at
+                    }
+                }),
+                &target,
+            ))
         }
         AnnotateAction::List {
             language,
@@ -2528,14 +2775,17 @@ fn handle_annotate(target: CommandTarget, action: AnnotateAction) -> Result<Valu
 
             let elapsed = timer.elapsed();
 
-            Ok(attach_target(json!({
-                "ok": true,
-                "command": "annotate",
-                "action": "list",
-                "elapsed_secs": elapsed.as_secs_f64(),
-                "count": filtered.len(),
-                "results": filtered
-            }), &target))
+            Ok(attach_target(
+                json!({
+                    "ok": true,
+                    "command": "annotate",
+                    "action": "list",
+                    "elapsed_secs": elapsed.as_secs_f64(),
+                    "count": filtered.len(),
+                    "results": filtered
+                }),
+                &target,
+            ))
         }
         AnnotateAction::Remove { component_id } => {
             if target.is_foreign() {
@@ -2549,14 +2799,17 @@ fn handle_annotate(target: CommandTarget, action: AnnotateAction) -> Result<Valu
             }
             let elapsed = timer.elapsed();
 
-            Ok(attach_target(json!({
-                "ok": true,
-                "command": "annotate",
-                "action": "remove",
-                "elapsed_secs": elapsed.as_secs_f64(),
-                "component_id": component_id,
-                "removed": removed
-            }), &target))
+            Ok(attach_target(
+                json!({
+                    "ok": true,
+                    "command": "annotate",
+                    "action": "remove",
+                    "elapsed_secs": elapsed.as_secs_f64(),
+                    "component_id": component_id,
+                    "removed": removed
+                }),
+                &target,
+            ))
         }
     }
 }
@@ -2626,7 +2879,17 @@ fn normalize_language(value: &str) -> Result<String> {
 }
 
 fn supported_languages() -> Vec<&'static str> {
-    vec!["rust", "javascript", "typescript", "python", "go", "zig", "c", "cpp"]
+    vec![
+        "rust",
+        "javascript",
+        "typescript",
+        "python",
+        "go",
+        "zig",
+        "c",
+        "cpp",
+        "swift",
+    ]
 }
 
 fn is_component_type_filter(value: &str) -> bool {
@@ -2756,7 +3019,10 @@ mod tests {
         };
         let result = attach_target(payload, &target);
         assert_eq!(
-            result.get("target").and_then(|t| t.get("mode")).and_then(Value::as_str),
+            result
+                .get("target")
+                .and_then(|t| t.get("mode"))
+                .and_then(Value::as_str),
             Some("external")
         );
         assert_eq!(
@@ -2860,11 +3126,7 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("lime-git-partial-{suffix}"));
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("src").join("a.rs"),
-            "pub fn a() {}\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("src").join("a.rs"), "pub fn a() {}\n").unwrap();
 
         assert!(
             Command::new("git")
@@ -2900,49 +3162,21 @@ mod tests {
         config.git_partial_sync.empty_sync_uses_git = true;
         config.save(&root).unwrap();
 
-        let first = handle_sync(
-            root.clone(),
-            Vec::new(),
-            false,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
+        let first = handle_sync(root.clone(), Vec::new(), false, false, false, false).unwrap();
         assert_eq!(first.get("sync_mode").and_then(Value::as_str), Some("full"));
         assert_eq!(
             first.get("git_partial_skip_reason").and_then(Value::as_str),
             Some("empty_index")
         );
 
-        let second = handle_sync(
-            root.clone(),
-            Vec::new(),
-            false,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
+        let second = handle_sync(root.clone(), Vec::new(), false, false, false, false).unwrap();
         assert_eq!(
             second.get("sync_mode").and_then(Value::as_str),
             Some("noop")
         );
 
-        std::fs::write(
-            root.join("src").join("a.rs"),
-            "pub fn a() -> i32 { 42 }\n",
-        )
-        .unwrap();
-        let third = handle_sync(
-            root.clone(),
-            Vec::new(),
-            false,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
+        std::fs::write(root.join("src").join("a.rs"), "pub fn a() -> i32 { 42 }\n").unwrap();
+        let third = handle_sync(root.clone(), Vec::new(), false, false, false, false).unwrap();
         assert_eq!(
             third.get("sync_mode").and_then(Value::as_str),
             Some("git_partial")

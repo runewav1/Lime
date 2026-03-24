@@ -132,6 +132,13 @@ pub fn unregister_project(project_id: &str) -> Result<bool> {
     Ok(removed)
 }
 
+/// Returns true if `project_id` is registered (registry file may be missing → false).
+pub fn is_registered(project_id: &str) -> bool {
+    load_registry()
+        .map(|r| r.projects.contains_key(project_id))
+        .unwrap_or(false)
+}
+
 pub fn resolve_project_root(project_id: &str) -> Result<PathBuf> {
     let registry = load_registry()?;
     let Some(reg) = registry.projects.get(project_id) else {

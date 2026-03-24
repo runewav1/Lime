@@ -99,10 +99,10 @@ Source code + line numbers + inline diagnostics + annotation.
 lime --json show fn-61bcc6dabec3f308
 ```
 
-**JSON:** `{ok, command:"show", component:{id, language, type, name, file, start_line, end_line, death_status, faults}, file_changed, source_lines:[{line, code, diagnostics:[]}], annotation, index_staleness}`
+**JSON:** `{ok, command:"show", component:{id, language, type, name, file, start_line, end_line, death_status, faults, uses_before, used_by_after, dep_edges?}, file_changed, source_lines:[{line, code, diagnostics:[]}], annotation, index_staleness}`
 
 ### deps <component_id> [--depth <n>]
-Dependency matrix (uses / used-by). Default depth from config (usually 2).
+Dependency matrix (uses / used-by). Default depth from config (usually 2). Traverses the same `uses_before` / `used_by_after` graph stored on each component after `lime sync`.
 
 ```bash
 lime --json deps fn-61bcc6dabec3f308
@@ -111,6 +111,15 @@ lime --json deps fn-61bcc6dabec3f308 --depth 0   # component only; obsolete
 ```
 
 **JSON:** `{ok, command:"deps", component, dependency_matrix, elapsed_secs}`
+
+**How edges are inferred (heuristic, not a full type system):**
+
+- Component bodies are **sanitized** before matching: `//` and `/* */` comments, Python `#` (outside quotes), and best-effort removal of `"..."` / simple `'...'` literals so mentions inside them do not create edges.
+- **Same file:** another indexed symbol’s **name** appears as a whole identifier in the sanitized body (`uses_before` edge).
+- **Imports + global name:** identifier tokens in the body that appear in that file’s import/`use` lines, resolved against the language-wide name index. If several components share the same name, a **deterministic** pick is used (same file → same parent directory → shorter path → lexicographic id) instead of dropping the edge.
+- **`::Name` tails:** the identifier after `::` is resolved the same way when unambiguous after disambiguation.
+- **`dep_edges`:** optional parallel list on each component with `kind`: `same_file` | `import_resolved` | `qualified` | `import_disambiguated` (same targets as `uses_before`; stronger kinds win when merged).
+- **Death detection** uses the same undirected graph as `lime deps` (built from `uses_before` ∪ `used_by_after`) for reachability; passes 2–3 still scan source text for symbol mentions.
 
 ### annotate {add|show|list|remove}
 
@@ -124,7 +133,7 @@ lime --json annotate list [language] [type]   # e.g. `rs fn`, `py class`, `ts fn
 lime --json annotate remove <id>
 ```
 
-Flags: `-m/--message` (inline body), `--file` (body from path; exclusive with `-m`), `-t/--tag` (repeatable), `-l/--link` (repeatable link paths; **dual-written** to `.lime/component_links.json` and the annotation file).
+Flags: `-m/--message` (inline body), `--file` (body from path; exclusive with `-m`), `-t/--tag` (repeatable), `-l/--link` (repeatable link paths; validated like `lime links add`; **dual-written** to `.lime/component_links.json` and the annotation file when paths validate).
 
 **JSON:** `{ok, command:"annotate", action, elapsed_secs, annotation:{hash_id, content, tags, links, created_at, updated_at}}` (list → `results:[{component, annotation:{...preview}}]`, remove → `{removed}`)
 
@@ -132,8 +141,11 @@ Flags: `-m/--message` (inline body), `--file` (body from path; exclusive with `-
 
 - **Delimiter:** `/` only. Segments are non-empty; no leading/trailing `/`, no `//`.
 - **Hierarchy:** prefix = ancestry (`auth` is parent of `auth/login`).
+- **Local paths:** `auth`, `auth/login`, … (same rules as above).
+- **Scoped paths (cross-repo topics):** `@<project_id>/<topic>` where `project_id` is a key in `~/.lime/projects.json` (`lime registry add`). The topic tail uses the same segment rules as local paths. Example: `@tokio/runtime/handler`. Writes validate the registry; stored strings are plain text in `.lime/component_links.json` (no automatic mirror to the other repo).
 - **Order (default):** Unicode **lexicographic** sort on the full path. Encode timelines with zero-padded segments, e.g. `auth/01-discovery`, `auth/02-design`, or date buckets `auth/2026-03/01-login`.
-- **Matching:** `lime links show <query>` matches a path **equal** to `query` or any path **under** `query/` (case-insensitive).
+- **Matching:** `lime links show <query>` matches a path **equal** to `query` or any path **under** `query/` (case-insensitive), including scoped strings (e.g. query `@tokio/auth` matches `@tokio/auth/login`).
+- **`--peer-resolve` (show only):** With a scoped query `@peer/topic`, add `--peer-resolve` to also load that peer’s index and list components whose **local** paths match `topic` (suffix after `@peer/`). JSON marks each hit with `match_source`: `scoped` vs `peer_local`, and peer hits include `peer_project_id`, `peer_repo_root`, `matched_local_paths`. Costs an extra index load; default `show` stays cheap.
 - **Limits:** path length and count per component are capped (see code: `MAX_LINK_PATH_LEN`, `MAX_PATHS_PER_COMPONENT`).
 
 Optional **`.lime/link_catalog.json`**: map path → `{ title, description, parent_path, sort_key }`. When present, `sort_key` orders paths before lexicographic path (used by `lime links list` and `lime links show` grouping).
@@ -145,16 +157,20 @@ Single command for all link workflows (merged **`.lime/component_links.json`** +
 ```bash
 lime --json links show auth               # components on path auth or under auth/…
 lime --json links show auth/login --notes # include full annotation bodies
+lime --json links show @myapp/auth        # scoped path (myapp must be in registry)
+lime --json links show @myapp/auth --peer-resolve  # + peer repo components with local path auth/…
 lime --json links list                    # all distinct paths
 lime --json links list auth --tree        # indent by / depth
 lime --json links add fn-abc123 auth/login
+lime --json links add fn-abc123 @other/topic   # cross-repo topic (other registered)
+lime --json --external other links add fn-x @app/auth   # edit foreign repo’s .lime/
 lime --json links remove fn-abc123 auth/login
 lime --json links compact                 # drop duplicate link lines from annotations when store has path
 ```
 
 **JSON:** `{ok, command:"links", action, elapsed_secs, ...}`
 
-- **show** — `action:"show"`, plus `link`, `notes`, `result_count`, `results`, `path_groups`, `orphan_count`, `orphans`, `orphan_memberships`, `index_staleness`, …
+- **show** — `action:"show"`, plus `link`, `notes`, `peer_resolve`, `result_count`, `results` (optional `match_source`, `peer_project_id`, `peer_repo_root`, `matched_local_paths`), `path_groups`, `orphan_count`, `orphans`, `orphan_memberships`, `index_staleness`, …
 - **list** — `paths`, `path_count`, `tree`, `prefix`
 - **remove** — `removed`
 - **compact** — `annotations_updated`
@@ -167,7 +183,7 @@ Bounded overview; **`links_top`** counts components per path using the **same me
 
 Global router file: `~/.lime/projects.json` (small JSON map only; indexes stay in each repo’s `.lime/`).
 
-No `.lime` init is required to **register** a path: `registry add` only records the root so `--external` can route reads (and safe `annotate add`) there.
+No `.lime` init is required to **register** a path: `registry add` only records the root so `--external` can route reads and scoped link operations there.
 
 ```bash
 lime --json registry list
@@ -187,7 +203,8 @@ Route supported commands to another registered repository without copying indexe
 lime --json show --external tokio fn-abc123
 lime --json search --external tokio reactor
 lime --json links show --external tokio runtime
-lime --json annotate add --external tokio fn-abc123 -m "used by app X"
+lime --json links add --external tokio fn-abc123 @app/feature
+lime --json annotate add --external tokio fn-abc123 -m "used by app X" -l @app/feature
 ```
 
 Responses for routed commands include:
@@ -201,9 +218,10 @@ Safety policy (foreign repository target):
 | Command area | `--external` |
 |---|---|
 | `show`, `deps`, `search`, `list`, `sum`, `links show/list`, `annotate show/list` | Allowed (read-only) |
-| `annotate add` | Allowed (**annotation markdown only**) |
+| `annotate add` | Allowed (writes `.lime/annotations/` **and** dual-writes valid link paths to that repo’s `.lime/component_links.json`) |
+| `links add` / `links remove` / `links compact` | Allowed (writes that repo’s `.lime/component_links.json` and annotations for **compact**) |
 | `annotate remove` | Blocked |
-| `sync`, `add`, `remove`, `links add/remove/compact`, `config`, `registry` | Blocked |
+| `sync`, `add`, `remove`, `config`, `registry` | Blocked |
 
 ### config … [--global]
 
@@ -284,11 +302,12 @@ Default ignores: `node_modules`, `target`, `.git`, `.lime`, `.lemon`
 - **Link membership:** `.lime/component_links.json` (source of truth; unioned with annotation `links` on read)
 - **Optional:** `.lime/link_catalog.json` (titles / `sort_key` overrides per path)
 - Index is line/regex parsed (not AST); treat as approximate for macros/generated code
+- Per-component **`uses_before`**, **`used_by_after`**, and optional **`dep_edges`** (kinds) are rebuilt on every sync
 
 ### Agent workflow (links)
 
 1. `lime --json sum` → scan `links_top` for hot paths.
-2. `lime --json link <path>` → pull grouped components for that topic.
+2. `lime --json links show <path>` → pull grouped components for that topic (use `@peer/topic` for cross-repo; add `--peer-resolve` to include the peer’s local-path matches).
 3. Prefer `lime --json links add <id> <path>` for membership without touching prose; use `annotate add -l` when you also need a written note (**dual-write** keeps legacy annotation `links` in sync).
 4. After migrating to the store, `lime --json links compact` removes redundant `links` lines from annotation frontmatter.
 5. Re-run `lime sync` if IDs drift; fix **orphan_memberships** (stale IDs in the link store) or re-link components.
