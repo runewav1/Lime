@@ -174,6 +174,14 @@ fn render_sync(v: &Value, s: &Style) -> String {
                 s.dim(fb)
             );
         }
+        if let Some(reason) = v.get("git_partial_skip_reason").and_then(Value::as_str) {
+            let _ = writeln!(
+                out,
+                "\n{} {}",
+                s.dim("git partial deferred:"),
+                s.dim(reason)
+            );
+        }
     } else if scope == "partial" {
         let sync_mode = str_val(v, "sync_mode");
         if let Some(result) = v.get("result") {

@@ -37,12 +37,14 @@ pub struct LimeConfig {
     pub git_partial_sync: GitPartialSyncConfig,
 }
 
-/// When `empty_sync_uses_git` is true, `lime sync` with no file arguments runs partial sync
-/// on paths reported by `git status --porcelain` (unless overridden by `--no-git` / `--git`).
+/// When `empty_sync_uses_git` is true, bare `lime sync` (no file arguments) uses partial sync
+/// on paths from `git status --porcelain` **only after** the index already has at least one
+/// component. The first run (empty index) always performs a full index so the tree is covered.
+/// Override with `--git` / `--no-git` as usual.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GitPartialSyncConfig {
-    /// If true, `lime sync` with no paths uses git working-tree changes for partial indexing.
+    /// If true, bare `lime sync` uses git dirty paths for partial indexing once the index is non-empty.
     pub empty_sync_uses_git: bool,
 }
 

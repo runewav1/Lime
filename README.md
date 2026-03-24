@@ -6,7 +6,7 @@
 
 ## Features
 
-- **Index** — full sync, git-partial sync (optional), or per-file `add` / `remove`
+- **Index** — full sync, optional git-partial sync on dirty paths (after the index has components), or per-file `add` / `remove`
 - **Discover** — `search` (substring or `--fuzzy`), `list` with `--dead` / `--fault` filters
 - **Inspect** — `show` (source + line refs + optional diagnostics), `deps` (uses / used-by)
 - **Notes & navigation** — `annotate`, `links` (merged store + annotation paths), `sum` overview

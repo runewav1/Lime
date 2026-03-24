@@ -282,7 +282,7 @@ enum Commands {
     /// only those files are re-indexed; the rest stays intact.
     ///
     /// Examples:
-    ///   "lime sync"                        full index (default) or git partial if configured
+    ///   "lime sync"                        full index, or git partial if configured (only after index exists)
     ///   "lime sync --git"                  partial sync on git dirty paths
     ///   "lime sync --no-git"               full rebuild even if config uses git partial
     ///   "lime sync src/main.rs"            re-index a single file (git flags ignored)
@@ -684,7 +684,7 @@ enum ConfigAction {
         pretty: Option<bool>,
     },
 
-    /// Git-assisted partial sync when `lime sync` is run with no file arguments.
+    /// Git-assisted partial sync for bare `lime sync` (no file args), after the index has components.
     ///
     /// Examples:
     ///   "lime config git-partial-sync"
@@ -928,13 +928,27 @@ fn handle_sync(
         return Ok(response);
     }
 
-    let use_git_partial = if git {
+    let mut use_git_partial = if git {
         true
     } else if no_git {
         false
     } else {
         config.git_partial_sync.empty_sync_uses_git
     };
+
+    // Git-partial only applies once the index has components; otherwise a dirty-path-only pass
+    // would miss most of the tree on the first run.
+    let mut loaded_for_git: Option<IndexData> = None;
+    let mut git_partial_skip_reason: Option<&'static str> = None;
+    if use_git_partial {
+        let current = storage::load_index_or_empty(&root, &config)?;
+        if current.components.is_empty() {
+            use_git_partial = false;
+            git_partial_skip_reason = Some("empty_index");
+        } else {
+            loaded_for_git = Some(current);
+        }
+    }
 
     if !use_git_partial {
         let timer = std::time::Instant::now();
@@ -955,6 +969,11 @@ fn handle_sync(
             "elapsed_secs": elapsed.as_secs_f64(),
             "index": index_payload_with_staleness(&root, &index)
         });
+        if let Some(reason) = git_partial_skip_reason {
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("git_partial_skip_reason".into(), json!(reason));
+            }
+        }
         if verbose {
             if let Some(obj) = response.as_object_mut() {
                 obj.insert("verbose".into(), json!(true));
@@ -992,7 +1011,7 @@ fn handle_sync(
         return Ok(response);
     }
 
-    let current = storage::load_index_or_empty(&root, &config)?;
+    let current = loaded_for_git.expect("loaded when git partial path is active");
     let dirty = match git_staleness::worktree_changed_paths(&root) {
         Ok(d) => d,
         Err(e) => {
@@ -2724,6 +2743,7 @@ fn truncate_preview(content: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -2830,5 +2850,104 @@ mod tests {
         let q = parse_search_terms(vec!["rs".into(), "main".into()]).unwrap();
         assert_eq!(q.language.as_deref(), Some("rust"));
         assert_eq!(q.query, "main");
+    }
+
+    #[test]
+    fn git_partial_deferred_until_index_nonempty() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lime-git-partial-{suffix}"));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src").join("a.rs"),
+            "pub fn a() {}\n",
+        )
+        .unwrap();
+
+        assert!(
+            Command::new("git")
+                .args(["init"])
+                .current_dir(&root)
+                .status()
+                .expect("git")
+                .success(),
+            "git init failed — install git for this test"
+        );
+        assert!(Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        let mut config = LimeConfig::load_or_create(&root).unwrap();
+        config.git_partial_sync.empty_sync_uses_git = true;
+        config.save(&root).unwrap();
+
+        let first = handle_sync(
+            root.clone(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(first.get("sync_mode").and_then(Value::as_str), Some("full"));
+        assert_eq!(
+            first.get("git_partial_skip_reason").and_then(Value::as_str),
+            Some("empty_index")
+        );
+
+        let second = handle_sync(
+            root.clone(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            second.get("sync_mode").and_then(Value::as_str),
+            Some("noop")
+        );
+
+        std::fs::write(
+            root.join("src").join("a.rs"),
+            "pub fn a() -> i32 { 42 }\n",
+        )
+        .unwrap();
+        let third = handle_sync(
+            root.clone(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            third.get("sync_mode").and_then(Value::as_str),
+            Some("git_partial")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

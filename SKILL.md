@@ -8,7 +8,7 @@ Language-aware codebase index for AI agents. Indexes functions, structs, classes
 ## Quick Start
 
 ```
-lime --json sync                          # full index (default) or git partial if configured
+lime --json sync                          # full or git partial (see git-partial-sync; first run is always full)
 lime --json search run                    # find components named "run"
 lime --json list rust --all               # list all rust components with IDs
 lime --json show fn-61bcc6dabec3f308      # show component source
@@ -26,9 +26,9 @@ Rebuild index. **With file paths:** partial re-index of only those files (`--git
 |------------|--------|
 | `--git` | Partial sync on paths from `git status --porcelain` (working tree + untracked). |
 | `--no-git` | Full rebuild (overrides `git_partial_sync.empty_sync_uses_git`). |
-| Neither | If `git_partial_sync.empty_sync_uses_git` is **true**, same as `--git`; else **full** rebuild. |
+| Neither | If `git_partial_sync.empty_sync_uses_git` is **true** and the index **already has at least one component**, same as `--git`; if the index is **empty**, **full** rebuild (first run must cover the tree). If the flag is **false**, **full** rebuild. |
 
-If git mode is selected but the project is **not** a git repo (or `git status` fails), Lime **falls back to a full rebuild** and sets JSON `git_partial_fallback` (`not_a_git_repository` / `git_status_failed`). If the work tree is clean or every dirty path is ignored / non-indexable, JSON has `scope: "noop"`, `sync_mode: "noop"` (index refreshed; no file re-parse).
+If git mode is selected but the project is **not** a git repo (or `git status` fails), Lime **falls back to a full rebuild** and sets JSON `git_partial_fallback` (`not_a_git_repository` / `git_status_failed`). When git-partial would apply but the index is still empty, Lime runs a **full** index and sets JSON `git_partial_skip_reason` to `empty_index`. If the work tree is clean or every dirty path is ignored / non-indexable, JSON has `scope: "noop"`, `sync_mode: "noop"` (index refreshed; no file re-parse).
 
 There is **no background watcher**—run `lime sync` when you want the index updated.
 
@@ -41,7 +41,7 @@ lime --json sync --diagnostics            # attach static-analyzer faults
 lime --json sync -v                       # verbose breakdown
 ```
 
-**JSON (selected):** `sync_mode`: `full` | `git_partial` | `noop` | `partial`; optional `git_partial: { candidates, sync_paths }`, `git_partial_fallback`. When `sync_mode` is **`git_partial`**, responses include **`sync_delta`**: `components_added` / `components_removed` (IDs), counts, `files_new_to_index` vs `files_reindexed`, and `files_touched_count`. A content-only refresh can yield **zero net component IDs** while files still appear under `result.indexed` / `files_reindexed`—human output reports *“no additional components found”* for that case.
+**JSON (selected):** `sync_mode`: `full` | `git_partial` | `noop` | `partial`; optional `git_partial: { candidates, sync_paths }`, `git_partial_fallback`, `git_partial_skip_reason` (`empty_index` when a full run was required before git-partial can apply). When `sync_mode` is **`git_partial`**, responses include **`sync_delta`**: `components_added` / `components_removed` (IDs), counts, `files_new_to_index` vs `files_reindexed`, and `files_touched_count`. A content-only refresh can yield **zero net component IDs** while files still appear under `result.indexed` / `files_reindexed`—human output reports *“no additional components found”* for that case.
 
 ### add <filepath>
 Add/refresh a single file. Returns `{ok, command:"add", elapsed_secs, request:{filename}, result, index}`.
@@ -273,7 +273,7 @@ Use `lime config --global <subcommand>` to manage global preferences. The file i
 | `death_seeds.seed_files` | [] | File patterns (always-alive) |
 | `death_seeds.seed_names` | [] | Component name patterns (always-alive) |
 | `death_seeds.seed_types` | [] | Component types (always-alive) |
-| `git_partial_sync.empty_sync_uses_git` | false | If true, bare `lime sync` uses git dirty paths (partial) instead of full rebuild |
+| `git_partial_sync.empty_sync_uses_git` | false | If true, bare `lime sync` uses git dirty paths (partial) once the index is non-empty; first sync is always full |
 
 Default ignores: `node_modules`, `target`, `.git`, `.lime`, `.lemon`
 
